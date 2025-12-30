@@ -74,7 +74,7 @@ def _uint(width: int):
     Most common older forms:
         Type.int(width, False)
         Type.int(width, signedBool)
-    Some builds: Type.int(width) defaults signed -> we'll fallback.
+    Some builds: Type.int(width) defaults signed -> will fallback.
     """
     try:
         return Type.int(width, False)

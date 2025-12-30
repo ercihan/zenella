@@ -21,20 +21,11 @@ In Binary Ninja:
   Example: `/Users/ercihan/Library/Application\ Support/Binary\ Ninja/plugins`
 
 ### 2) Copy the plugin file
-Place the plugin into the above found folder path and restart Binary Ninja.
+Place the plugin into e.g. `/Users/ercihan/Library/Application\ Support/Binary\ Ninja/plugins` path and restart Binary Ninja.
 
 ### 3) Check plugins
 As soon as the Binary Ninja has been restarted you should see a menu like this:<br>
 ![pluginOverview](media/pluginOverview.png)
-
-## Type Setup (what the plugin expects)
-
-Most reliable workflow:
-1) In Binary Ninja, open the microcode `.bin`
-2) Go to `Types` -> `Create Types from C Source…`
-3) Paste the C struct definitions (header/random blocks/micro-op struct/region struct)
-
-The plugin then calls `bv.get_type_by_name(...)` and applies these types at the correct offsets.
 
 ## Menu Commands and What They Do
 
