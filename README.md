@@ -63,4 +63,4 @@ The plugin typically registers commands like these (names depend on your exact p
   Your browser does not support the video tag.
 </video>
 
-[▶ Play the workflow video](media/workflowExample.mp4)
+https://github.com/user-attachments/assets/34329feb-1495-4056-b591-df9c792c84b0
