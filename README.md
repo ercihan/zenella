@@ -71,3 +71,5 @@ The plugin typically registers commands like these (names depend on your exact p
   <source src="media/workflowExample.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
+
+[▶ Play the workflow video](media/workflowExample.mp4)
