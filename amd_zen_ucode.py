@@ -2,7 +2,7 @@
 #####################################################################################################
 #####################################################################################################
 # Author: Kaya Ercihan
-# Version: 1.1
+# Version: 1.2
 # Description: Define and apply AMD Zen microcode layout in Binary Ninja.
 # Self-containment: define types + apply AMD microcode layout (works across older BN Python API variants)
 # License: GPL
@@ -78,17 +78,49 @@ LOADER_ID_ENUM = {
     "AMD_MC_LOADER_8016": 0x8016,
 }
 
+# Important: the byte alone is not a full micro-op decode. Several meanings are
+# opclass-dependent, e.g. 0x00 is OP_LD/OP_ST, 0xA0 is OP_MOV/OP_SREG, and
+# 0xFF is OP_NOP only for OPCLASS_SPEC.
 ZEN_OPCODE_ENUM = {
-    "AMD_ZEN_UOP_UNKNOWN":    0x00,
-    "AMD_ZEN_TYPE5_READ":     0xDE,
-    "AMD_ZEN_TYPE7_ALU_OR":   0xBE,
-    "AMD_ZEN_TYPE3_WRITE":    0xA0,
-    "AMD_ZEN_TYPE_REG_NOP":   0xFF,
+    # Class-dependent / non-RegOp opcodes
+    "AMD_ZEN_UOP_LD_ST_00":        0x00,
+    "AMD_ZEN_BR_JMP":              0x05,
 
-    # Complements to avoid "~NAME" rendering in some BN builds.
-    "AMD_ZEN_UOP_21":         0x21,  # ~0xDE & 0xFF
-    "AMD_ZEN_UOP_41":         0x41,  # ~0xBE & 0xFF
-    "AMD_ZEN_UOP_5F":         0x5F,  # ~0xA0 & 0xFF
+    # RegOp / RegX opcodes
+    "AMD_ZEN_REG_NSUB":             0x19,
+    "AMD_ZEN_REG_AND":              0x30,
+    "AMD_ZEN_REG_SHL":              0x40,
+    "AMD_ZEN_REG_BLL":              0x41,
+    "AMD_ZEN_REG_ROL":              0x42,
+    "AMD_ZEN_REG_RLC":              0x44,
+    "AMD_ZEN_REG_RRD":              0x46,
+    "AMD_ZEN_REG_SRC":              0x47,
+    "AMD_ZEN_REG_SHR":              0x48,
+    "AMD_ZEN_REG_ROR":              0x4A,
+    "AMD_ZEN_REG_RRC":              0x4C,
+    "AMD_ZEN_REG_SRD":              0x4F,
+    "AMD_ZEN_REG_SUB":              0x50,
+    "AMD_ZEN_REG_SBB":              0x52,
+    "AMD_ZEN_REG_NADD":             0x55,
+    "AMD_ZEN_REG_ADD2":             0x5C,
+    "AMD_ZEN_REG_ADC":              0x5D,
+    "AMD_ZEN_REG_ADD3":             0x5E,
+    "AMD_ZEN_REG_ADD":              0x5F,
+    "AMD_ZEN_REG_VZEROUPPER_64B":   0x6F,
+    "AMD_ZEN_REG_POPCNT":           0x70,
+    "AMD_ZEN_REG_SBIT":             0x72,
+    "AMD_ZEN_REG_VZEROUPPER_32B":   0x7F,
+    "AMD_ZEN_REG_MOV2":             0x93,
+    "AMD_ZEN_REG_MOV_SREG":         0xA0,
+    "AMD_ZEN_REG_BSWAP":            0xA9,
+    "AMD_ZEN_REG_XOR":              0xB5,
+    "AMD_ZEN_REG_OR":               0xBE,
+    "AMD_ZEN_REG_SRC_CF_CANDIDATE": 0x47, # Research-ToDo: CF-candidate / target-like imm -> not confirmed as branch opcode yet
+
+    # SpecOp opcode
+    "AMD_ZEN_SPEC_NOP":             0xFF,
+
+    "AMD_ZEN_TYPE5_READ":           0xDE,
 }
 
 #############################
