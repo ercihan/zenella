@@ -59,7 +59,7 @@ The plugin typically registers commands like these (names depend on your exact p
 
 ## Common workflow in action (video)
 <video controls width="720">
-  <source src="media/workflowExample.mp4" type="video/mp4">
+  <source src="media/demoVideoZenellaV1.2.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 
