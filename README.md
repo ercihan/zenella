@@ -63,4 +63,6 @@ The plugin typically registers commands like these (names depend on your exact p
   Your browser does not support the video tag.
 </video>
 
-https://github.com/user-attachments/assets/ee68d1ea-b8fb-478a-8a3e-c21d8ae99a45
+https://github.com/user-attachments/assets/d15d805b-866c-4494-bcf9-918ed7bc2ea7
+
+
