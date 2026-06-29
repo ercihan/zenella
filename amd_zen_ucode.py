@@ -10,6 +10,9 @@
 #####################################################################################################
 #####################################################################################################
 
+import json
+import os
+
 from binaryninja import (
     PluginCommand, log_info, log_warn, log_error,
     Type, StructureBuilder, EnumerationBuilder, QualifiedName,
@@ -122,6 +125,67 @@ ZEN_OPCODE_ENUM = {
 
     "AMD_ZEN_TYPE5_READ":           0xDE,
 }
+
+#############################
+# CPUID -> CPU description lookup
+# Loaded from cpuid_descriptions.json at runtime
+# Originally loaded from https://instlatx64.github.io/InstLatx64/
+#############################
+_CPUID_DB = None
+
+def _load_cpuid_db():
+    global _CPUID_DB
+    if _CPUID_DB is not None:
+        return _CPUID_DB
+    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpuid_descriptions.json")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        db = {}
+        if isinstance(data, dict):
+            for cpuid, descs in data.items():
+                key = cpuid.upper().strip()
+                if isinstance(descs, list):
+                    db[key] = [str(d) for d in descs if d]
+                elif isinstance(descs, str) and descs:
+                    db[key] = [descs]
+        elif isinstance(data, list):
+            for entry in data:
+                cpuid = str(entry.get("cpuid", "")).upper().strip()
+                desc = str(entry.get("description", "")).strip()
+                if cpuid and desc:
+                    db.setdefault(cpuid, []).append(desc)
+        _CPUID_DB = db
+        log_info(f"Loaded {len(db)} CPUIDs from {json_path}")
+    except Exception as e:
+        log_warn(f"Failed to load CPUID database from {json_path}: {e}")
+        _CPUID_DB = {}
+    return _CPUID_DB
+
+def _proc_rev_to_cpuid(proc_rev):
+    """Convert AMD microcode processor revision ID to CPUID EAX format.
+
+    The proc_sig in the microcode header is a 16-bit packed ID:
+      [15:12]=ExtFamily [11:8]=ExtModel [7:4]=BaseModel [3:0]=Stepping
+    The CPUID EAX value has BaseFamily=0xF inserted:
+      [27:20]=ExtFamily [19:16]=ExtModel [11:8]=BaseFamily(0xF) [7:4]=BaseModel [3:0]=Stepping
+    """
+    proc_rev &= 0xFFFF
+    ext_family = (proc_rev >> 12) & 0xF
+    ext_model  = (proc_rev >> 8) & 0xF
+    base_model = (proc_rev >> 4) & 0xF
+    stepping   = proc_rev & 0xF
+    return (ext_family << 20) | (ext_model << 16) | (0xF << 8) | (base_model << 4) | stepping
+
+def _cpuid_description(cpuid_val):
+    db = _load_cpuid_db()
+    key = f"{cpuid_val:08X}"
+    descs = db.get(key)
+    if not descs:
+        return None
+    if len(descs) <= 3:
+        return " | ".join(descs)
+    return " | ".join(descs[:3]) + f" (+{len(descs)-3} more)"
 
 #############################
 # Helpers for old Type.int() signatures
@@ -404,6 +468,24 @@ def apply_layout_at(bv, base: int):
     )
 
     _define_var(bv, base + HDR_OFF, hdr_t, "amd_mc_header", "AMD microcode patch header")
+
+    # Auto-comment proc_sig with CPU description from CPUID database
+    # proc_sig in the microcode header is a processor revision ID, not raw CPUID EAX
+    try:
+        raw = bv.read(base + 0x18, 4)
+        if len(raw) == 4:
+            proc_rev = int.from_bytes(raw, "little")
+            cpuid_val = _proc_rev_to_cpuid(proc_rev)
+            desc = _cpuid_description(cpuid_val)
+            if desc:
+                comment = f"ProcRev 0x{proc_rev:04X} -> CPUID {cpuid_val:08X}: {desc}"
+            else:
+                comment = f"ProcRev 0x{proc_rev:04X} -> CPUID {cpuid_val:08X} (not in cpuid_descriptions.json)"
+            bv.set_comment_at(base + 0x18, comment)
+            log_info(comment)
+    except Exception:
+        pass
+
     _define_var(
         bv, base + SIGNATURE_OFF, Type.array(u8(), SIGNATURE_SIZE),
         "amd_mc_signature", "0x100-byte signature block"
