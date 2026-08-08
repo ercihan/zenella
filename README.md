@@ -2,11 +2,12 @@
   <img alt="zenella" src="media/zenellaLogo.png" width="160">
 </p>
 
-# AMD Zen 5 Microcode Update Reversing (call it `Zenella`) (Binary Ninja Plugin)
+# AMD Zen Microcode Update Reversing (call it `Zenella`) (Binary Ninja Plugin)
 
-This plugin adds a small set of **Binary Ninja menu commands** that help you quickly apply a known data-structure layout to AMD Zen 5 microcode `.bin` blobs (typically `0x3820` bytes). Once applied, the Binary Ninja “Linear” view becomes navigable: header fields are parsed, the random blocks are labeled, and the structured µcode region is represented as an array of 4-byte micro-ops.
+This plugin adds a set of **Binary Ninja menu commands** for reversing AMD Zen microcode update `.bin` blobs. It auto-detects the Zen profile, parses the update container (header, signature/modulus, match registers), and analyzes the payload:
 
-The plugin is intentionally lightweight: it does **not** disassemble microcode. It only maps bytes into structs and adds sparse comments for quick triage.
+- **Zen 1 / Zen 2**: microcode is **disassembled and LLIL-lifted** as a Binary Ninja architecture, Binary Ninja derives MLIL/HLIL automatically, so you get graph, cross-references, and decompilation over the 64 4-µop packages.
+- **Zen 5**: the `0x3820` container gets a structural/tag layout (header, blocks, µcode region as 4-byte micro-ops).
 
 ## Requirements
 
@@ -29,33 +30,21 @@ As soon as the Binary Ninja has been restarted you should see a menu like this:<
 
 ## Menu Commands and What They Do
 
-The plugin typically registers commands like these (names depend on your exact plugin version):
+All commands live under the **`AMD Microcode`** menu. The key ones:
 
-### 1) **Apply layout at file start (0x0)**
-**What it does**
-- Creates types (e.g. `amd_mc_header`, `amd_mc_random_blocks`, `amd_ucode_region`) for navigation
-- Applies the header struct at **0x0000**
-- Applies the random blocks struct at **0x0020**
-- Applies the structured µcode region at **0x0320**
+- **`Auto-detect and analyze at file start` / `at cursor`**, detect Zen1/Zen2/Zen5, annotate the container, and lift Zen1/Zen2 packages.
+- **`Define Zenella types (Zen1/Zen2/Zen5)`**, register the struct/enum types used for navigation.
+- **`Zen1 > …` / `Zen2 > …`**, `Apply layout + LLIL/HLIL` at file start or cursor for a specific profile.
+- **`Zen5 > Apply structural layout`**, apply the `0x3820` structural/tag layout at file start or cursor.
+- **`Zen1-Zen2 > …`**, ZenUtils-style disassembly report and aggressive/compact package analysis.
 
-**When to use**
-- Use this for normal microcode blobs where the file is mapped starting at offset `0`.
-
-### 2) **Apply layout at cursor**
-**What it does**
-- Same as "Apply layout at file start", but uses the current cursor address as the base.
-- Useful if the microcode blob is embedded inside a larger container and you navigated to the blob’s start.
-
-**Notes**
-- If there are not enough bytes remaining for a full `0x3820` blob, a well-behaved plugin will either:
-  1) apply a partial layout or
-  2) warn that the layout is partial
+Cursor variants use the current address as base, for blobs embedded in a larger container. Partial blobs are applied partially or warned about.
 
 ## Common Workflow
-1) Drop plugin into the `plugins/` folder
+1) Drop the plugin (`amd_zen_ucode.py` + `zenella_core.py`) into the `plugins/` folder
 2) Restart Binary Ninja
 3) Open a microcode `.bin`
-4) Run `Apply layout at file start (0x0)`
+4) Run `Auto-detect and analyze at file start`
 
 ## Common workflow in action (video)
 <video controls width="720">
