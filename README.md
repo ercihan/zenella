@@ -7,7 +7,7 @@
 This plugin adds a set of **Binary Ninja menu commands** for reversing AMD Zen microcode update `.bin` blobs. It auto-detects the Zen profile, parses the update container (header, signature/modulus, match registers), and analyzes the payload:
 
 - **Zen 1 / Zen 2**: microcode is **disassembled and LLIL-lifted** as a Binary Ninja architecture, Binary Ninja derives MLIL/HLIL automatically, so you get graph, cross-references, and decompilation over the 64 4-µop packages.
-- **Zen 5**: the `0x3820` container gets a structural/tag layout (header, blocks, µcode region as 4-byte micro-ops). An **experimental** command additionally renders those tags as an assembly-like listing, this is a structural tag view, **not** a real ISA decode (the Zen 5 micro-op ISA is undocumented; see [`ToDo.md`](ToDo.md)).
+- **Zen 5**: the `0x3820` container gets a structural/tag layout (header, blocks, µcode region as 4-byte micro-ops). An **experimental** command additionally renders those tags as an assembly-like listing, this is a structural tag view, **not** a real ISA decode (the Zen 5 micro-op ISA is undocumented).
 
 ## Requirements
 
