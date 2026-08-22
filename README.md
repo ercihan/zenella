@@ -7,7 +7,7 @@
 This plugin adds a set of **Binary Ninja menu commands** for reversing AMD Zen microcode update `.bin` blobs. It auto-detects the Zen profile, parses the update container (header, signature/modulus, match registers), and analyzes the payload:
 
 - **Zen 1 / Zen 2**: microcode is **disassembled and LLIL-lifted** as a Binary Ninja architecture, Binary Ninja derives MLIL/HLIL automatically, so you get graph, cross-references, and decompilation over the 64 4-µop packages.
-- **Zen 5**: the `0x3820` container gets a structural/tag layout (header, blocks, µcode region as 4-byte micro-ops).
+- **Zen 5**: the `0x3820` container gets a structural/tag layout (header, blocks, µcode region as 4-byte micro-ops). An **experimental** command additionally renders those tags as an assembly-like listing, this is a structural tag view, **not** a real ISA decode (the Zen 5 micro-op ISA is undocumented; see [`ToDo.md`](ToDo.md)).
 
 ## Requirements
 
@@ -36,6 +36,7 @@ All commands live under the **`AMD Microcode`** menu. The key ones:
 - **`Define Zenella types (Zen1/Zen2/Zen5)`**, register the struct/enum types used for navigation.
 - **`Zen1 > …` / `Zen2 > …`**, `Apply layout + LLIL/HLIL` at file start or cursor for a specific profile.
 - **`Zen5 > Apply structural layout`**, apply the `0x3820` structural/tag layout at file start or cursor.
+- **`Zen5 > (Experimental) Disassemble tags to assembly`** (file start / cursor), render each 4-byte structural tag as an assembly-like line (`offset: bytes  mnemonic  b1=.. imm16=..`). No ISA semantics inferred; unknown tags show as `.op 0xNN`. Tag view only, not a true Zen5 decode.
 - **`Zen1-Zen2 > …`**, ZenUtils-style disassembly report and aggressive/compact package analysis.
 
 Cursor variants use the current address as base, for blobs embedded in a larger container. Partial blobs are applied partially or warned about.

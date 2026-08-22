@@ -67,6 +67,9 @@ ZEN5_MASK_SIZE = 0x0030
 ZEN5_PAYLOAD_OFFSET = 0x0380
 ZEN5_PATCH_SIZE = 0x3820
 ZEN5_PAYLOAD_SIZE = ZEN5_PATCH_SIZE - ZEN5_PAYLOAD_OFFSET
+# Each Zen5 payload record is a 4-byte structural tag: opcode(u8) b1(u8) imm16(u16)
+# This is a container tag, not a decoded Zen5 instruction
+ZEN5_RECORD_SIZE = 4
 
 REGISTERS: Tuple[str, ...] = (
     "reg0", "reg1", "reg2", "reg3", "reg4", "reg5", "reg6", "reg7",
@@ -739,6 +742,90 @@ def iter_package_words(payload: bytes) -> Iterable[Tuple[int, Tuple[int, int, in
         yield slot, words, sequence
 
 
+#####################################################################################################
+# Zen5 structural tag rendering (experimental)
+#
+# Zen5 ISA semantics are not documented, so the payload is only structurally
+# tagged: each 4-byte record is opcode(u8) b1(u8) imm16(u16), where opcode maps to
+# the published AMD_Zen_Opcode structural-tag names. This renders those existing
+# tags as an assembly-like listing; it is NOT a real Zen5 instruction decode.
+#####################################################################################################
+@dataclass(frozen=True)
+class DecodedZen5Tag:
+    offset: int
+    raw: bytes
+    opcode: int
+    b1: int
+    imm16: int
+
+
+def decode_zen5_tag(record: bytes, offset: int = 0) -> DecodedZen5Tag:
+    if len(record) != ZEN5_RECORD_SIZE:
+        raise ValueError(
+            f"Zen5 record must be exactly {ZEN5_RECORD_SIZE} bytes; got {len(record)}"
+        )
+    return DecodedZen5Tag(
+        offset=offset,
+        raw=bytes(record),
+        opcode=record[0],
+        b1=record[1],
+        imm16=int.from_bytes(record[2:4], "little"),
+    )
+
+
+def _zen5_tag_mnemonic(opcode: int, tag_names: Dict[int, str]) -> Tuple[str, Optional[str]]:
+    """Return (display_mnemonic, full_tag_name). Unknown opcodes fall back to .op."""
+    full = tag_names.get(opcode)
+    if full is None:
+        return (f".op 0x{opcode:02x}", None)
+    # Strip the shared AMD_ZEN_ prefix for a compact mnemonic column
+    display = full
+    for prefix in ("AMD_ZEN_REG_", "AMD_ZEN_SPEC_", "AMD_ZEN_"):
+        if display.startswith(prefix):
+            display = display[len(prefix):]
+            break
+    return (display.lower(), full)
+
+
+def render_zen5_tag_lines(
+    payload: bytes,
+    tag_names: Dict[int, str],
+    base_offset: int = ZEN5_PAYLOAD_OFFSET,
+) -> Sequence[str]:
+    """Render the Zen5 payload as one assembly-like line per 4-byte structural tag.
+
+    Trailing all-zero records are collapsed into a single elision note so the
+    listing stays readable without silently dropping data.
+    """
+    usable = len(payload) - (len(payload) % ZEN5_RECORD_SIZE)
+    records = [
+        decode_zen5_tag(payload[i:i + ZEN5_RECORD_SIZE], base_offset + i)
+        for i in range(0, usable, ZEN5_RECORD_SIZE)
+    ]
+
+    # Determine how many trailing zero records to elide
+    last_meaningful = len(records)
+    while last_meaningful > 0 and records[last_meaningful - 1].raw == b"\x00\x00\x00\x00":
+        last_meaningful -= 1
+
+    lines = []
+    for tag in records[:last_meaningful]:
+        mnemonic, full = _zen5_tag_mnemonic(tag.opcode, tag_names)
+        comment = f"  ; {full} (tag)" if full else "  ; unknown structural tag"
+        lines.append(
+            f"0x{tag.offset:04x}: "
+            f"{tag.opcode:02x} {tag.b1:02x} {tag.imm16 & 0xff:02x} {(tag.imm16 >> 8) & 0xff:02x}  "
+            f"{mnemonic:<16} b1=0x{tag.b1:02x} imm16=0x{tag.imm16:04x}{comment}"
+        )
+
+    elided = len(records) - last_meaningful
+    if elided:
+        lines.append(f"; ... {elided} trailing all-zero record(s) elided")
+    if usable != len(payload):
+        lines.append(f"; note: {len(payload) - usable} trailing byte(s) below record size ignored")
+    return lines
+
+
 __all__: Sequence[str] = (
     "BRANCH_NAMES",
     "CHECK_OFFSET",
@@ -747,6 +834,7 @@ __all__: Sequence[str] = (
     "DecodedMatchEntry",
     "DecodedSequenceWord",
     "DecodedUop",
+    "DecodedZen5Tag",
     "DetectionResult",
     "HEADER_OFFSET",
     "HEADER_SIZE",
@@ -786,10 +874,12 @@ __all__: Sequence[str] = (
     "ZEN5_PATCH_SIZE",
     "ZEN5_PAYLOAD_OFFSET",
     "ZEN5_PAYLOAD_SIZE",
+    "ZEN5_RECORD_SIZE",
     "decode_match_entries",
     "decode_match_entry",
     "decode_sequence_word",
     "decode_uop",
+    "decode_zen5_tag",
     "detect_profile",
     "disassemble_uop",
     "expanded_cpuid_from_processor_signature",
@@ -799,6 +889,7 @@ __all__: Sequence[str] = (
     "package_offset",
     "parse_patch_header",
     "profile_from_processor_signature",
+    "render_zen5_tag_lines",
     "rom_address_to_payload_offset",
     "rom_address_to_slot",
     "slot_to_rom_address",

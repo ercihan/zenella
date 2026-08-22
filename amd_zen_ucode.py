@@ -99,6 +99,7 @@ try:  # Normal package import
         detect_profile,
         iter_package_words,
         parse_patch_header,
+        render_zen5_tag_lines,
         rom_address_to_payload_offset,
         rom_address_to_slot,
         slot_to_rom_address,
@@ -149,6 +150,7 @@ except ImportError:  # Direct import for manual development use
         detect_profile,
         iter_package_words,
         parse_patch_header,
+        render_zen5_tag_lines,
         rom_address_to_payload_offset,
         rom_address_to_slot,
         slot_to_rom_address,
@@ -247,6 +249,19 @@ ZEN_OPCODE_ENUM = {
 # Generation specific structural types keep the original member names
 # Do not add renamed aliases to AMD_Zen_Opcode
 ZEN5_OPCODE_TAGS = ZEN_OPCODE_ENUM
+
+
+def _build_zen5_tag_names() -> Dict[int, str]:
+    # Reverse the opcode tag map for rendering; keep the first name seen so
+    # duplicate values (e.g. 0x47 SRC / SRC_CF_CANDIDATE) resolve to the
+    # canonical, non-candidate mnemonic.
+    names: Dict[int, str] = {}
+    for name, value in ZEN5_OPCODE_TAGS.items():
+        names.setdefault(value, name)
+    return names
+
+
+_ZEN5_TAG_NAMES: Dict[int, str] = _build_zen5_tag_names()
 
 # Keep a small built in CPUID table when the JSON file is unavailable
 # This also covers users who copy only the Python files
@@ -2279,6 +2294,52 @@ def _show_zen12_report(bv, base: int, profile: Optional[ZenProfile] = None) -> N
         log_error(f"Zenella: disassembly report failed: {exc}")
 
 
+def _zen5_report_text(blob: bytes) -> str:
+    if len(blob) < ZEN5_PATCH_SIZE:
+        raise ValueError(f"Need 0x{ZEN5_PATCH_SIZE:x} bytes; got 0x{len(blob):x}")
+    lines = [
+        f"; Zenella {PLUGIN_VERSION} / EXPERIMENTAL Zen5 structural-tag listing",
+        "; This renders the AMD_Zen_Opcode structural tags only.",
+        "; It is NOT a decoded Zen5 instruction stream: Zen5 ISA semantics are",
+        "; undocumented, so operands beyond the raw imm16 tag payload are unknown.",
+        "",
+    ]
+    lines.extend(_format_header_directives(blob))
+
+    lines.extend(["", "; Match Registers"])
+    for index in range(0, ZEN5_MATCH_SIZE, 4):
+        word = int.from_bytes(blob[ZEN5_MATCH_OFFSET + index:ZEN5_MATCH_OFFSET + index + 4], "little")
+        lines.append(f".match_reg {index // 4} 0x{word:08x}")
+
+    lines.extend(["", "; Mask Registers"])
+    for index in range(0, ZEN5_MASK_SIZE, 4):
+        word = int.from_bytes(blob[ZEN5_MASK_OFFSET + index:ZEN5_MASK_OFFSET + index + 4], "little")
+        lines.append(f".mask_reg {index // 4} 0x{word:08x}")
+
+    lines.extend(["", "; Micro-op structural tags (offset: opcode b1 imm16lo imm16hi)"])
+    payload = blob[ZEN5_PAYLOAD_OFFSET:ZEN5_PAYLOAD_OFFSET + ZEN5_PAYLOAD_SIZE]
+    lines.extend(render_zen5_tag_lines(payload, _ZEN5_TAG_NAMES))
+    return "\n".join(lines)
+
+
+def _show_zen5_report(bv, base: int) -> None:
+    blob = bv.read(base, ZEN5_PATCH_SIZE)
+    if len(blob) < HEADER_SIZE:
+        log_error("Zenella: no complete AMD patch header at the selected address")
+        return
+    detection = detect_profile(blob)
+    if detection.profile is not None and detection.profile != ZEN5:
+        log_warn(
+            f"Zenella: address looks like {detection.profile.name}, not Zen5; "
+            "rendering the Zen5 structural tags anyway (experimental)"
+        )
+    try:
+        text = _zen5_report_text(blob)
+        show_plain_text_report(f"Zenella Zen5 tag listing @ 0x{base:x}", text)
+    except Exception as exc:
+        log_error(f"Zenella: Zen5 tag listing failed: {exc}")
+
+
 def _apply_profile(
     bv,
     base: int,
@@ -2407,6 +2468,14 @@ def cmd_report_cursor(bv, address):
     _show_zen12_report(bv, address)
 
 
+def cmd_zen5_report_start(bv):
+    _show_zen5_report(bv, 0)
+
+
+def cmd_zen5_report_cursor(bv, address):
+    _show_zen5_report(bv, address)
+
+
 # Keep the original Zenella 1.2 commands unchanged
 # They also repair stale type definitions from Zenella 2.0.0 and 2.0.1
 PluginCommand.register(
@@ -2474,6 +2543,16 @@ PluginCommand.register_for_address(
     "AMD Microcode\\Zen5\\Apply structural layout at cursor",
     "Apply the Zen5 structural/tag layout to an embedded patch",
     cmd_zen5_cursor,
+)
+PluginCommand.register(
+    "AMD Microcode\\Zen5\\(Experimental) Disassemble tags to assembly at file start",
+    "Render the Zen5 structural tags as an assembly-like listing (no ISA semantics inferred)",
+    cmd_zen5_report_start,
+)
+PluginCommand.register_for_address(
+    "AMD Microcode\\Zen5\\(Experimental) Disassemble tags to assembly at cursor",
+    "Render an embedded Zen5 patch's structural tags as an assembly-like listing",
+    cmd_zen5_report_cursor,
 )
 PluginCommand.register(
     "AMD Microcode\\Zen1-Zen2\\Show ZenUtils-style disassembly at file start",
