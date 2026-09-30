@@ -2,7 +2,7 @@
 #####################################################################################################
 #####################################################################################################
 # Author: Kaya Ercihan
-# Version: 2.0.4
+# Version: 2.2.0
 # Description: Parse AMD Zen microcode updates and lift Zen1 and Zen2 microcode in Binary Ninja
 # Self-containment: define data types, patch layouts, decoders, LLIL lifting and plugin commands
 # License: GPL-3.0-only
@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import traceback
 import threading
+import re
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from binaryninja import (
     Architecture,
@@ -53,7 +57,23 @@ from binaryninja import (
     show_plain_text_report,
 )
 
-try:  # Normal package import
+# The DataRenderer showing opcode enum names and the original instruction fields lives
+# in binaryninja.datarender (NOT the top-level package); DisassemblyTextLine is in
+# binaryninja.function. Import both defensively so a headless/stub import still works.
+try:
+    from binaryninja.datarender import DataRenderer
+except Exception:  # pragma: no cover - depends on Binary Ninja build
+    DataRenderer = None
+try:
+    from binaryninja.function import DisassemblyTextLine
+except Exception:  # pragma: no cover - depends on Binary Ninja build
+    try:
+        from binaryninja import DisassemblyTextLine
+    except Exception:
+        DisassemblyTextLine = None
+
+if __package__:  # Never fall back to an unrelated installed copy on ImportError.
+    from . import zenella_core as _core_module
     from .zenella_core import (
         CHECK_OFFSET,
         CHECK_SIZE,
@@ -83,28 +103,42 @@ try:  # Normal package import
         ZEN12_PAYLOAD_OFFSET,
         ZEN12_PAYLOAD_SIZE,
         ZEN12_ROM_START,
-        ZEN5_MASK_OFFSET,
-        ZEN5_MASK_SIZE,
-        ZEN5_MATCH_OFFSET,
-        ZEN5_MATCH_SIZE,
+        ZEN5_AUX_OFFSET,
+        parse_zen5_patch,
+        zen5_display_regions,
+        zen5_tail_holds_registers,
+        LoaderLayout,
+        get_loader_layout,
+        decode_zentool_sequence_word,
+        zen5_sequence_statistics,
         ZEN5_PATCH_SIZE,
-        ZEN5_PAYLOAD_OFFSET,
-        ZEN5_PAYLOAD_SIZE,
+        ZEN5_OPQUAD_SIZE,
+        ZEN5_UOPS_PER_QUAD,
+        ZEN5_RECORD_SIZE,
         DecodedSequenceWord,
+        ParsedZen5Patch,
         DecodedUop,
         ZenProfile,
         decode_match_entries,
         decode_sequence_word,
         decode_uop,
+        decode_zen5_tag,
         detect_profile,
         iter_package_words,
         parse_patch_header,
-        render_zen5_tag_lines,
+        zen5_uop_field_text,
+        zen5_uop_operand_text,
+        zen5_is_ldstop,
+        zen5_is_alignment_artifact,
+        zen5_detect_body_sections,
+        zen5_nop_alignment_hint,
+        OPCLASS_NAMES,
         rom_address_to_payload_offset,
         rom_address_to_slot,
         slot_to_rom_address,
     )
-except ImportError:  # Direct import for manual development use
+else:  # Direct import for manual development use
+    import zenella_core as _core_module
     from zenella_core import (  # type: ignore
         CHECK_OFFSET,
         CHECK_SIZE,
@@ -134,30 +168,126 @@ except ImportError:  # Direct import for manual development use
         ZEN12_PAYLOAD_OFFSET,
         ZEN12_PAYLOAD_SIZE,
         ZEN12_ROM_START,
-        ZEN5_MASK_OFFSET,
-        ZEN5_MASK_SIZE,
-        ZEN5_MATCH_OFFSET,
-        ZEN5_MATCH_SIZE,
+        ZEN5_AUX_OFFSET,
+        parse_zen5_patch,
+        zen5_display_regions,
+        zen5_tail_holds_registers,
+        LoaderLayout,
+        get_loader_layout,
+        decode_zentool_sequence_word,
+        zen5_sequence_statistics,
         ZEN5_PATCH_SIZE,
-        ZEN5_PAYLOAD_OFFSET,
-        ZEN5_PAYLOAD_SIZE,
+        ZEN5_OPQUAD_SIZE,
+        ZEN5_UOPS_PER_QUAD,
+        ZEN5_RECORD_SIZE,
         DecodedSequenceWord,
+        ParsedZen5Patch,
         DecodedUop,
         ZenProfile,
         decode_match_entries,
         decode_sequence_word,
         decode_uop,
+        decode_zen5_tag,
         detect_profile,
         iter_package_words,
         parse_patch_header,
-        render_zen5_tag_lines,
+        zen5_uop_field_text,
+        zen5_uop_operand_text,
+        zen5_is_ldstop,
+        zen5_is_alignment_artifact,
+        zen5_detect_body_sections,
+        zen5_nop_alignment_hint,
+        OPCLASS_NAMES,
         rom_address_to_payload_offset,
         rom_address_to_slot,
         slot_to_rom_address,
     )
 
 
-PLUGIN_VERSION = "2.0.4"
+if __package__:
+    from . import zenella_inspect as _inspect_module
+else:
+    import zenella_inspect as _inspect_module
+
+PLUGIN_VERSION = "2.2.0"
+# A balanced menu: auto-detect, one submenu per architecture (Zen1/Zen2 disassembly
+# + lifting, Zen5 structural layout), plus the Zen1-Zen2 report. Remove old installed
+# plugin copies so their separate menu registrations/renderers cannot compete.
+MENU_ROOT = "AMD Microcode"
+# Retained so existing scripts referencing the old two-command names keep working.
+APPLY_START_COMMAND = MENU_ROOT + r"\Zen5\Apply structural layout at file start"
+APPLY_CURSOR_COMMAND = MENU_ROOT + r"\Zen5\Apply structural layout at cursor"
+
+
+def _check_module_versions() -> None:
+    """Prevent a stale core from silently restoring an older layout on reapply."""
+    root = os.path.dirname(os.path.realpath(__file__))
+    for module, attr in ((_core_module, "CORE_VERSION"), (_inspect_module, "VERSION")):
+        actual = getattr(module, attr, "missing")
+        path = os.path.realpath(getattr(module, "__file__", ""))
+        if actual != PLUGIN_VERSION or os.path.dirname(path) != root:
+            raise RuntimeError(
+                f"Zenella {PLUGIN_VERSION}: mixed or stale modules: {path} is {actual}. "
+                f"Replace all three scripts in {root} and restart Binary Ninja; "
+                "no layout has been applied.")
+
+
+
+def _check_loaded_plugin_copies() -> None:
+    """Reject competing in-process Zenella renderers before changing the BNDB.
+
+    Detection is limited to imported modules, not a recursive disk scan. Module
+    aliases for the same object are harmless. No code is unloaded or monkey-
+    patched: native DataRenderer registrations can outlive Python references.
+    """
+    current = sys.modules.get(__name__)
+    seen = {id(current)}
+    conflicts = []
+    for name, module in tuple(sys.modules.items()):
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        namespace = getattr(module, "__dict__", {})
+        filename = os.path.basename(str(namespace.get("__file__", "")))
+        old_filename = re.fullmatch(r"(?:\d{4}-\d{2}-\d{2}_)?amd_zen_ucode\.py", filename)
+        if (old_filename or (isinstance(namespace.get("ZEN_OPCODE_ENUM"), dict)
+                and callable(namespace.get("_apply_zen5_layout")))):
+            conflicts.append(
+                f"{name}: version {namespace.get('PLUGIN_VERSION', 'unknown')} at "
+                f"{namespace.get('__file__', '<unknown path>')}")
+    if conflicts:
+        raise RuntimeError(
+            "Another Zenella plugin module is loaded; its commands or renderer "
+            "can replace this build's output. Move the older plugin copy outside "
+            "Binary Ninja's plugin directories and restart. Conflicting modules:\n"
+            + "\n".join(conflicts))
+
+
+def _show_apply_error(message: str) -> None:
+    """Make a failed click visible instead of leaving only a Log entry."""
+    try:
+        from binaryninja.interaction import show_message_box
+        show_message_box(f"Zenella {PLUGIN_VERSION}: layout NOT applied", message)
+    except (ImportError, AttributeError):
+        # Headless integrations still receive the full error via log_error.
+        return
+    except Exception as exc:
+        log_warn(f"Zenella: could not display the error dialog: {exc}")
+
+
+def _show_notice(title: str, message: str) -> None:
+    """Make a non-fatal notice visible instead of leaving only a Log entry."""
+    try:
+        from binaryninja.interaction import show_message_box
+        show_message_box(f"Zenella {PLUGIN_VERSION}: {title}", message)
+    except (ImportError, AttributeError):
+        # Headless integrations still receive the same text via log_warn.
+        return
+    except Exception as exc:
+        log_warn(f"Zenella: could not display the notice dialog: {exc}")
+
+
+_check_module_versions()
 SYNTHETIC_REGION_ALIGNMENT = 0x10000
 SYNTHETIC_REGION_MASK = ~(SYNTHETIC_REGION_ALIGNMENT - 1)
 CODE_LABEL_SYMBOL = getattr(SymbolType, "LocalLabelSymbol", SymbolType.DataSymbol)
@@ -178,9 +308,31 @@ T_ZEN12_PAYLOAD = "AMD_Zen12_ExecutablePayload"
 T_ZEN12_PATCH = "AMD_Zen12_Patch"
 T_ZEN5_MATCH = "AMD_Zen5_MatchRegisterBlock"
 T_ZEN5_MASK = "AMD_Zen5_MaskRegisterBlock"
+T_ZEN5_PRECODE = "AMD_Zen5_PreCodeMetadata"
 T_ZEN5_TAG = "AMD_Zen5_MicroOpTag"
 T_ZEN5_PAYLOAD = "AMD_Zen5_MicrocodeRegion"
 T_ZEN5_PATCH = "AMD_Zen5_Patch"
+
+# Both layouts use enum-backed 64-bit field structures and four-uop records.
+# The empirical 0x420 and upstream 0x418 geometries are independently selectable.
+T_ZEN5_MICROOP64 = "AMD_Zen5_MicroOp64"
+T_ZEN5_OPQUAD = "AMD_Zen5_OpQuad"
+T_ZEN5_OPQUAD_REGION = "AMD_Zen5_OpQuadRegion"
+T_ZEN5_AUX = "AMD_Zen5_AuxiliaryRaw"
+T_ZEN5_MATCHMASK = "AMD_Zen5_MatchMaskTable"
+SYM_ZEN5_OPQUADS = "amd_ucode_opquads"
+SYM_ZEN5_BODY = "amd_ucode_body"
+SYM_ZEN5_PRECODE = "amd_mc_register_table"
+SYM_ZEN5_METADATA = "amd_mc_prefix_metadata"
+SYM_ZEN5_MATCHMASK = "amd_mc_match_mask_table"
+SYM_ZEN5_AUX = "amd_mc_auxiliary_raw"
+
+# Superseded type names; unrelated database types are never deleted globally.
+OBSOLETE_ZEN5_TYPES = (
+    "AMD_Zen5_OpClass",
+    "AMD_Zen5_LdStOpcodeTag",
+    "AMD_Zen5_UnknownPrefix",
+)
 
 # Keep the Zenella 1.2 type names for existing Binary Ninja databases
 # Scripts, screenshots and research notes may still use these names
@@ -192,6 +344,10 @@ T_LEGACY_UOP = "AMD_Zen_MicroOp"
 T_LEGACY_PAYLOAD = "AMD_Zen_MicrocodeRegion"
 T_LEGACY_PATCH = "AMD_MC_Patch"
 
+# Register dimensions are provided by get_loader_layout(), never a global
+# 10/12 partition. The optional researcher split is configured centrally in
+# zenella_core.ZENELLA_REGISTER_SPLITS and must consume the complete table.
+
 LOADER_ID_ENUM = {
     "AMD_MC_LOADER_8004": 0x8004,
     "AMD_MC_LOADER_8005": 0x8005,
@@ -202,11 +358,16 @@ LOADER_ID_ENUM = {
 
 # Keep the Zenella 1.2 enum ABI exactly as published
 # Existing BNDBs, scripts, screenshots and research notes depend on these names and values
-# The opcode byte is only a structural tag
+# The opcode tag is the original full-word bit slice 47..54
 # It is not a complete Zen5 instruction decode
 ZEN_OPCODE_ENUM = {
     # Opcodes whose meaning depends on the instruction class
     "AMD_ZEN_UOP_LD_ST_00":        0x00,
+    # LdStOp resolves to a concrete LD/ST by the ldst bit (bit45). Synthetic values (>0xFF)
+    # never collide with the 8-bit [47:55] opcode slice used by RegOps; the 16-bit-wide enum
+    # holds them fine. A LdStOp is identified by class (bits 59..61), not by these values.
+    "AMD_ZEN_LD":                  0x100,
+    "AMD_ZEN_ST":                  0x101,
     "AMD_ZEN_BR_JMP":              0x05,
 
     # RegOp and RegX opcodes
@@ -245,6 +406,15 @@ ZEN_OPCODE_ENUM = {
 
     "AMD_ZEN_TYPE5_READ":           0xDE,
 }
+
+# Absolute little-endian bit positions; preserved from the supplied Zenella mapping.
+ZEN5_UOP_FIELDS = (
+    ("imm16", 0, 16), ("imm_flags", 16, 5), ("rt", 21, 5),
+    ("rs", 26, 5), ("rd", 31, 5), ("flags", 36, 6),
+    ("size", 42, 3), ("load", 45, 1), ("store", 46, 1),
+    ("opcode", 47, 8), ("mid", 55, 4), ("exec_unit", 59, 3),
+    ("hi", 62, 2),
+)
 
 # Generation specific structural types keep the original member names
 # Do not add renamed aliases to AMD_Zen_Opcode
@@ -328,52 +498,104 @@ def _new_structure_builder():
 
 
 def _type_structure(builder):
-    if hasattr(Type, "structure"):
-        try:
-            return Type.structure(builder)
-        except Exception:
-            pass
-    if hasattr(Type, "structure_type"):
-        return Type.structure_type(builder)
-    raise RuntimeError("No Type.structure/Type.structure_type API is available")
+    """Freeze the existing builder, preserving its width, packing and bitfields.
+
+    Type.structure(builder) is NOT a builder finalizer in BN 6: its first
+    argument is a member iterable and packed defaults to False. Reconstructing
+    an already-built structure that way needlessly loses builder attributes.
+    """
+    freeze = getattr(builder, "immutable_copy", None)
+    if callable(freeze):
+        result = freeze()
+    else:
+        # Older APIs exposed a dedicated conversion, not the members factory.
+        convert = getattr(Type, "structure_type", None)
+        if not callable(convert):
+            raise RuntimeError("Binary Ninja provides no supported structure-builder finalizer")
+        result = convert(builder)
+    if len(result) != builder.width:
+        raise RuntimeError(f"Structure finalization changed width: {builder.width} -> {len(result)}")
+    packed = getattr(result, "packed", None)
+    if packed is not None and bool(packed) != bool(builder.packed):
+        raise RuntimeError("Structure finalization did not preserve packed layout")
+    return result
 
 
 def _named_type(bv, name: str):
     value = bv.get_type_by_name(name)
     if value is None:
         raise RuntimeError(f"Required Binary Ninja type {name!r} is missing")
+    # Registered references bind to the actual BNDB type ID, rather than a
+    # detached snapshot retaining unknown1/unknown2 or the old register table.
+    factory = getattr(Type, "named_type_from_registered_type", None)
+    if callable(factory):
+        return factory(bv, _qn(name))
     try:
         return Type.named_type_from_type(_qn(name), value)
     except Exception:
         return value
 
 
+def _insert_bitfield(builder, member_type, name: str, bit_offset: int, bit_width: int) -> None:
+    """Insert a packed bitfield member across Binary Ninja API variants.
+
+    'bit_offset' is the absolute bit position within the containing word; it is
+    split into a byte offset and an in-byte bit position for the Binary Ninja API.
+    """
+    byte_offset, bit_position = divmod(bit_offset, 8)
+    attempts = (
+        lambda: builder.insert(
+            byte_offset, member_type, name, overwrite_existing=False,
+            bit_position=bit_position, bit_width=bit_width,
+        ),
+        lambda: builder.add_member_at_offset(
+            name, member_type, byte_offset, overwrite_existing=False,
+            bit_position=bit_position, bit_width=bit_width,
+        ),
+    )
+    last_error = None
+    for attempt in attempts:
+        try:
+            attempt()
+            return
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Cannot insert bitfield {name!r}") from last_error
+
+
 def _make_enum_type(values: Dict[str, int], width: int):
+    """Create an unsigned enum with an exact byte width.
+
+    Binary Ninja 5.x changed the positional Type.enumeration signature; keyword
+    arguments and immutable_copy avoid accidentally creating a native-width or
+    signed enum (which would render high opcode tags as negative numbers).
+    """
+    members = list(values.items())
     try:
-        builder = EnumerationBuilder.create()
+        return Type.enumeration(arch=None, members=members, width=width, sign=False)
+    except Exception:
+        pass
+    try:
+        builder = EnumerationBuilder.create(width=width, sign=False)
     except Exception:
         try:
-            builder = EnumerationBuilder()
+            builder = EnumerationBuilder.create()
+            builder.width = width
+            builder.signed = False
         except Exception:
             return None
-    try:
-        builder.width = width
-    except Exception:
-        pass
-    try:
-        builder.signed = False
-    except Exception:
-        pass
-    for name, value in values.items():
+    for name, value in members:
         try:
             builder.append(name, value)
         except Exception:
             return None
+    try:
+        return builder.immutable_copy()
+    except Exception:
+        pass
     for candidate in (
-        lambda: Type.enumeration(builder),
-        lambda: Type.enumeration_type(width, builder),
-        lambda: Type.enumeration_type(builder, width),
-        lambda: Type.enumeration_type(builder),
+        lambda: Type.enumeration_type(None, builder, width, False),
+        lambda: Type.enumeration_type(None, builder),
     ):
         try:
             return candidate()
@@ -495,17 +717,208 @@ def _cpuid_comment(signature: int, profile: Optional[ZenProfile] = None) -> str:
         rendered = " | ".join(descriptions[:3])
         if len(descriptions) > 3:
             rendered += f" (+{len(descriptions) - 3} more)"
-        return f"ProcRev 0x{proc_rev:04X} -> CPUID {cpuid_value:08X}: {rendered}"
+        return (f"ProcRev 0x{proc_rev:04X} -> CPUID {cpuid_value:08X}; "
+                f"database example(s): {rendered}. "
+                "CPUID alone does not identify SKU, socket count, core count, or SMT state.")
     return (
         f"ProcRev 0x{proc_rev:04X} -> CPUID {cpuid_value:08X} "
         "(not in cpuid_descriptions.json)"
     )
 
 
+def _is_default_zen5_geometry(geometry: LoaderLayout) -> bool:
+    """Canonical names describe one fixed geometry, so other loaders cannot resize it."""
+    return (geometry.format_id, geometry.quad_offset, geometry.quad_count,
+            geometry.patch_size, geometry.register_split) == (
+                0x8015, 0x420, 256, 0x3820, (31, 31))
+
+
+def _zen5_layout_type_names(geometry: LoaderLayout) -> Dict[str, str]:
+    """Keep screenshot-era names for the default profile; scope alternative layouts."""
+    if zen5_tail_holds_registers(geometry):
+        # Experimental tail model: metadata before the op-quads; equal match/mask
+        # register halves after them. Distinct _TAIL_ names so these never collide
+        # with the before-code default's T_ZEN5_*/legacy type names.
+        suffix = f"L{geometry.format_id:04X}_{geometry.quad_offset:04X}_{geometry.quad_count:03X}_TAIL"
+        return {
+            "prefix_metadata": f"AMD_Zen5_{suffix}_PreCodeMetadata",
+            "opquads": f"AMD_Zen5_{suffix}_OpQuadRegion",
+            "body": f"AMD_Zen5_{suffix}_MicrocodeRegion",
+            "match_registers": f"AMD_Zen5_{suffix}_MatchRegisterBlock",
+            "mask_registers": f"AMD_Zen5_{suffix}_MaskRegisterBlock",
+            "patch": f"AMD_Zen5_{suffix}_Patch",
+        }
+    if _is_default_zen5_geometry(geometry):
+        return {
+            "register_table": T_ZEN5_PRECODE,  # not instantiated in the split view
+            "match_registers": T_LEGACY_MATCH,
+            "mask_registers": T_LEGACY_MASK,
+            "opquads": T_ZEN5_OPQUAD_REGION,
+            "body": T_ZEN5_PAYLOAD,
+            "auxiliary_raw": T_ZEN5_AUX,
+            "patch": T_ZEN5_PATCH,
+        }
+    suffix = f"L{geometry.format_id:04X}_{geometry.quad_offset:04X}_{geometry.quad_count:03X}"
+    if geometry.register_split is not None:
+        suffix += "_M%d_K%d" % geometry.register_split
+    return {
+        "register_table": f"AMD_MC_{suffix}_RegisterTable",
+        "match_registers": f"AMD_MC_{suffix}_MatchRegisterBlock",
+        "mask_registers": f"AMD_MC_{suffix}_MaskRegisterBlock",
+        "opquads": f"AMD_Zen5_{suffix}_OpQuadRegion",
+        "body": f"AMD_Zen5_{suffix}_MicrocodeRegion",
+        "auxiliary_raw": f"AMD_Zen5_{suffix}_AuxiliaryData",
+        "patch": f"AMD_Zen5_{suffix}_Patch",
+    }
+
+
+def _define_zen5_tail_register_types(bv, geometry: LoaderLayout, names: Dict[str, str]) -> None:
+    """Corrected Zen5 model: metadata block -> op-quads -> match/mask table.
+
+    On the real 0x8015/B110 samples the match/mask registers follow the op-quads
+    (low-entropy 13-bit ROM addresses + masks + control words), and the 0x328
+    pre-op-quad block is high-entropy metadata, not match registers.
+    """
+    prefix = _new_structure_builder()
+    prefix.packed = True
+    prefix.append(Type.array(u32(), geometry.register_dwords), "metadata_word")
+    prefix_type = _type_structure(prefix)
+    if len(prefix_type) != geometry.register_size:
+        raise RuntimeError("Prefix metadata block width differs from the selected profile")
+    bv.define_user_type(_qn(names["prefix_metadata"]), prefix_type)
+
+    region = _new_structure_builder()
+    region.packed = True
+    region.append(Type.array(_named_type(bv, T_ZEN5_OPQUAD), geometry.quad_count), "opquads")
+    region_type = _type_structure(region)
+    bv.define_user_type(_qn(names["opquads"]), region_type)
+    bv.define_user_type(_qn(names["body"]), region_type)  # body is op-quads only
+
+    if geometry.auxiliary_size % 8:
+        raise RuntimeError("post-code register area is not two equal DWORD halves")
+    half_dwords = geometry.auxiliary_size // 8
+    for key, field in (("match_registers", "match_reg"), ("mask_registers", "mask_reg")):
+        block = _new_structure_builder()
+        block.packed = True
+        block.append(Type.array(u32(), half_dwords), field)
+        block_type = _type_structure(block)
+        if len(block_type) != half_dwords * 4:
+            raise RuntimeError("Register block width differs from the selected profile")
+        bv.define_user_type(_qn(names[key]), block_type)
+
+    patch = _new_structure_builder()
+    patch.packed = True
+    patch.append(_named_type(bv, T_HEADER), "header")
+    patch.append(Type.array(u8(), SIGNATURE_SIZE), "signature")
+    patch.append(Type.array(u8(), MODULUS_SIZE), "modulus")
+    patch.append(Type.array(u8(), CHECK_SIZE), "check")
+    patch.append(_named_type(bv, T_OPTIONS), "options")
+    patch.append(u32(), "rev")
+    patch.append(_named_type(bv, names["prefix_metadata"]), "prefix_metadata")
+    if patch.width != geometry.quad_offset:
+        raise RuntimeError("Microcode body offset differs from the selected loader profile")
+    patch.append(_named_type(bv, names["body"]), "body")
+    patch.append(_named_type(bv, names["match_registers"]), "match_registers")
+    patch.append(_named_type(bv, names["mask_registers"]), "mask_registers")
+    patch_type = _type_structure(patch)
+    if len(patch_type) != geometry.patch_size:
+        raise RuntimeError("Patch aggregate must cover the loader-selected extent")
+    bv.define_user_type(_qn(names["patch"]), patch_type)
+
+
+def _define_zen5_geometry_types(bv, geometry: LoaderLayout, body_opquads_only: bool = False) -> None:
+    """Two independent named blocks, not a replacement generic RegisterTable.
+
+    body_opquads_only: the manual layout separates the trailing zero padding into
+    its own region, so the body is the op-quads alone (no folded data_words) and the
+    patch aggregate carries the padding as a distinct trailing member.
+    """
+    names = _zen5_layout_type_names(geometry)
+    if zen5_tail_holds_registers(geometry):
+        _define_zen5_tail_register_types(bv, geometry, names)
+        return
+    metadata_members = []
+    if geometry.register_split is None:
+        table = _new_structure_builder()
+        table.packed = True
+        table.append(Type.array(u32(), geometry.register_dwords), "register_word")
+        bv.define_user_type(_qn(names["register_table"]), _type_structure(table))
+        metadata_members.append((names["register_table"], "register_table"))
+    else:
+        for key, count, field, member in zip(
+            ("match_registers", "mask_registers"), geometry.register_split,
+            ("match_reg", "mask_reg"), ("match_regs", "mask_regs"),
+        ):
+            block = _new_structure_builder()
+            block.packed = True
+            block.append(Type.array(u32(), count), field)
+            block_type = _type_structure(block)
+            if len(block_type) != count * 4:
+                raise RuntimeError("Register block width differs from the selected profile")
+            bv.define_user_type(_qn(names[key]), block_type)
+            metadata_members.append((names[key], member))
+        if _is_default_zen5_geometry(geometry):
+            bv.define_user_type(_qn(T_ZEN5_MATCH), bv.get_type_by_name(T_LEGACY_MATCH))
+            bv.define_user_type(_qn(T_ZEN5_MASK), bv.get_type_by_name(T_LEGACY_MASK))
+    if sum(len(bv.get_type_by_name(n)) for n, _ in metadata_members) != geometry.register_size:
+        raise RuntimeError("Register blocks must end exactly at the selected body offset")
+
+    # Keep the instruction-only type for scripts; the visible body also accounts
+    # for stored data after the 256 quads. These words are NOT made-up opcodes.
+    region = _new_structure_builder()
+    region.packed = True
+    region.append(Type.array(_named_type(bv, T_ZEN5_OPQUAD), geometry.quad_count), "opquads")
+    bv.define_user_type(_qn(names["opquads"]), _type_structure(region))
+
+    body = _new_structure_builder()
+    body.packed = True
+    body.append(Type.array(_named_type(bv, T_ZEN5_OPQUAD), geometry.quad_count), "opquads")
+    if geometry.auxiliary_size and not body_opquads_only:
+        if geometry.auxiliary_size % 4:
+            raise RuntimeError("Selected body-data extent is not a whole number of DWORDs")
+        body.append(Type.array(u32(), geometry.auxiliary_size // 4), "data_words")
+    body_type = _type_structure(body)
+    expected_body_len = (geometry.quad_count * ZEN5_OPQUAD_SIZE if body_opquads_only
+                         else geometry.patch_size - geometry.quad_offset)
+    if len(body_type) != expected_body_len:
+        raise RuntimeError("Body type must cover all bytes after the register blocks")
+    bv.define_user_type(_qn(names["body"]), body_type)
+    if _is_default_zen5_geometry(geometry):
+        bv.define_user_type(_qn(T_LEGACY_PAYLOAD), body_type)
+
+    patch = _new_structure_builder()
+    patch.packed = True
+    patch.append(_named_type(bv, T_HEADER), "header")
+    patch.append(Type.array(u8(), SIGNATURE_SIZE), "signature")
+    patch.append(Type.array(u8(), MODULUS_SIZE), "modulus")
+    patch.append(Type.array(u8(), CHECK_SIZE), "check")
+    patch.append(_named_type(bv, T_OPTIONS), "options")
+    patch.append(u32(), "rev")
+    for name, member in metadata_members:
+        patch.append(_named_type(bv, name), member)
+    # Independent size check prevents a guessed register count shifting code.
+    if patch.width != geometry.quad_offset:
+        raise RuntimeError("Microcode body offset differs from the selected loader profile")
+    patch.append(_named_type(bv, names["body"]), "body")
+    if body_opquads_only:
+        trailing = geometry.patch_size - geometry.code_end
+        if trailing > 0:
+            patch.append(Type.array(u8(), trailing), "zero_padding")
+    patch_type = _type_structure(patch)
+    if len(patch_type) != geometry.patch_size:
+        raise RuntimeError("Patch aggregate must cover the loader-selected extent")
+    bv.define_user_type(_qn(names["patch"]), patch_type)
+    if _is_default_zen5_geometry(geometry):
+        bv.define_user_type(_qn(T_LEGACY_PATCH), patch_type)
+
+
 def _ensure_types(
     bv,
     force_legacy_zen5: bool = False,
     force_zen12: bool = False,
+    zen5_layout: str = "loader",
+    zen5_geometry: Optional[LoaderLayout] = None,
+    zen5_body_opquads_only: bool = False,
 ) -> None:
     """Define common, Zen1/Zen2 and Zen5 structural types.
 
@@ -521,7 +934,7 @@ def _ensure_types(
     repair already-open BNDBs that retained the old aggregate.
     """
     # Loader ID enum
-    if bv.get_type_by_name(T_LOADER_ENUM) is None:
+    if force_legacy_zen5 or bv.get_type_by_name(T_LOADER_ENUM) is None:
         enum_type = _make_enum_type(LOADER_ID_ENUM, 2)
         if enum_type is not None:
             bv.define_user_type(_qn(T_LOADER_ENUM), enum_type)
@@ -540,7 +953,7 @@ def _ensure_types(
         bv.define_user_type(_qn(T_CPUID), _type_structure(cpuid))
 
     # Common 0x20 byte update header matching the Zenella 1.2 layout
-    if bv.get_type_by_name(T_HEADER) is None:
+    if force_legacy_zen5 or bv.get_type_by_name(T_HEADER) is None:
         header = _new_structure_builder()
         header.packed = True
         header.append(u16(), "year")
@@ -548,9 +961,8 @@ def _ensure_types(
         header.append(u8(), "month")
         header.append(u32(), "update_revision")
         header.append(loader_type, "loader_id")
-        header.append(u8(), "data_size")
-        header.append(u8(), "init_flag")
-        header.append(u32(), "data_checksum")
+        header.append(u16(), "size_of_patch")
+        header.append(u32(), "minimum_patch_level")
         header.append(u16(), "nb_ven")
         header.append(u16(), "nb_dev")
         header.append(u16(), "sb_ven")
@@ -562,8 +974,11 @@ def _ensure_types(
         header.append(u8(), "reserved2")
         bv.define_user_type(_qn(T_HEADER), _type_structure(header))
 
-    # Keep the current Zenella interpretation of bytes 0x320 to 0x323
-    if bv.get_type_by_name(T_OPTIONS) is None:
+    # Restore the screenshot-era API: autorun, encrypted, uint16_t loaderid.
+    # The research profile selects its geometry using this LE16 at +0x322.
+    # Native zentool still calls the bytes unknown1/unknown2 and uses +0x08;
+    # the parser retains that distinction in explicit reference mode.
+    if force_legacy_zen5 or bv.get_type_by_name(T_OPTIONS) is None:
         options = _new_structure_builder()
         options.packed = True
         options.append(u8(), "autorun")
@@ -617,112 +1032,60 @@ def _ensure_types(
         patch.append(_named_type(bv, T_ZEN12_PAYLOAD), "payload")
         bv.define_user_type(_qn(T_ZEN12_PATCH), _type_structure(patch))
 
-    # Zen5 remains a structural tagging profile
-    # Do not infer unsupported instruction semantics from the four byte records
-    # Repair existing databases with the exact Zenella 1.2 enum
-    # This also restores the legacy type graph
-    if force_legacy_zen5 or bv.get_type_by_name("AMD_Zen5_OpcodeTag") is None:
-        enum_type = _make_enum_type(ZEN_OPCODE_ENUM, 1)
-        if enum_type is not None:
-            bv.define_user_type(_qn("AMD_Zen5_OpcodeTag"), enum_type)
+    # Restore the complete user enum, including aliases and custom mappings.
+    # It is a labeling table; it is not restricted by old-zentool operation classes.
+    for enum_name in (T_LEGACY_OPCODE, "AMD_Zen5_OpcodeTag"):
+        if force_legacy_zen5 or bv.get_type_by_name(enum_name) is None:
+            enum_type = _make_enum_type(ZEN_OPCODE_ENUM, 2)
+            if enum_type is not None:
+                bv.define_user_type(_qn(enum_name), enum_type)
 
-    if force_legacy_zen5 or bv.get_type_by_name(T_LEGACY_OPCODE) is None:
-        enum_type = _make_enum_type(ZEN_OPCODE_ENUM, 1)
-        if enum_type is not None:
-            bv.define_user_type(_qn(T_LEGACY_OPCODE), enum_type)
-        else:
-            log_warn("Zenella: could not create AMD_Zen_Opcode; falling back to uint8")
+    opcode_type = (_named_type(bv, T_LEGACY_OPCODE)
+                   if bv.get_type_by_name(T_LEGACY_OPCODE) is not None else u16())
+    def _build_zen5_uop():
+        uop = _new_structure_builder()
+        uop.packed = True
+        # A backing type must hold bit_position + bit_width. For example rd
+        # begins at byte 3, bit 7 and needs uint16_t, not a one-byte container.
+        for field, bit_offset, bit_width in ZEN5_UOP_FIELDS:
+            member_type = opcode_type if field == "opcode" else (
+                u16() if bit_offset % 8 + bit_width > 8 else u8())
+            _insert_bitfield(uop, member_type, field, bit_offset, bit_width)
+        uop.width = ZEN5_RECORD_SIZE
+        result = _type_structure(uop)
+        if len(result) != ZEN5_RECORD_SIZE:
+            raise RuntimeError("Zen5 micro-op type must occupy exactly eight bytes")
+        _verify_opcode_types(bv, result)
+        return result
 
-    opcode_type = (
-        _named_type(bv, "AMD_Zen5_OpcodeTag")
-        if bv.get_type_by_name("AMD_Zen5_OpcodeTag")
-        else u8()
-    )
-    legacy_opcode_type = (
-        _named_type(bv, T_LEGACY_OPCODE)
-        if bv.get_type_by_name(T_LEGACY_OPCODE)
-        else opcode_type
-    )
+    for name in (T_ZEN5_MICROOP64, T_ZEN5_TAG, T_LEGACY_UOP):
+        if force_legacy_zen5 or bv.get_type_by_name(name) is None:
+            bv.define_user_type(_qn(name), _build_zen5_uop())
 
-    if force_legacy_zen5 or bv.get_type_by_name(T_ZEN5_MATCH) is None:
-        match = _new_structure_builder()
-        match.packed = True
-        match.append(Type.array(u32(), ZEN5_MATCH_SIZE // 4), "match_reg")
-        bv.define_user_type(_qn(T_ZEN5_MATCH), _type_structure(match))
+    if force_legacy_zen5 or bv.get_type_by_name(T_ZEN5_OPQUAD) is None:
+        quad = _new_structure_builder()
+        quad.packed = True
+        for index in range(ZEN5_UOPS_PER_QUAD):
+            quad.append(_named_type(bv, T_ZEN5_MICROOP64), f"uop{index}")
+        quad.append(u32(), "sequence_word")
+        quad_type = _type_structure(quad)
+        if len(quad_type) != ZEN5_OPQUAD_SIZE:
+            raise RuntimeError("Zen5 op-quad type must occupy exactly 36 bytes")
+        bv.define_user_type(_qn(T_ZEN5_OPQUAD), quad_type)
 
-    if force_legacy_zen5 or bv.get_type_by_name(T_LEGACY_MATCH) is None:
-        match = _new_structure_builder()
-        match.packed = True
-        match.append(Type.array(u32(), ZEN5_MATCH_SIZE // 4), "match_reg")
-        bv.define_user_type(_qn(T_LEGACY_MATCH), _type_structure(match))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_ZEN5_MASK) is None:
-        mask = _new_structure_builder()
-        mask.packed = True
-        mask.append(Type.array(u32(), ZEN5_MASK_SIZE // 4), "mask_reg")
-        bv.define_user_type(_qn(T_ZEN5_MASK), _type_structure(mask))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_LEGACY_MASK) is None:
-        mask = _new_structure_builder()
-        mask.packed = True
-        mask.append(Type.array(u32(), ZEN5_MASK_SIZE // 4), "mask_reg")
-        bv.define_user_type(_qn(T_LEGACY_MASK), _type_structure(mask))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_ZEN5_TAG) is None:
-        tag = _new_structure_builder()
-        tag.packed = True
-        tag.append(opcode_type, "opcode_tag")
-        tag.append(u8(), "b1")
-        tag.append(u16(), "imm16_or_payload")
-        bv.define_user_type(_qn(T_ZEN5_TAG), _type_structure(tag))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_LEGACY_UOP) is None:
-        tag = _new_structure_builder()
-        tag.packed = True
-        tag.append(legacy_opcode_type, "opcode")
-        tag.append(u8(), "b1")
-        tag.append(u16(), "imm16")
-        bv.define_user_type(_qn(T_LEGACY_UOP), _type_structure(tag))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_ZEN5_PAYLOAD) is None:
-        payload = _new_structure_builder()
-        payload.packed = True
-        payload.append(Type.array(_named_type(bv, T_ZEN5_TAG), ZEN5_PAYLOAD_SIZE // 4), "records")
-        bv.define_user_type(_qn(T_ZEN5_PAYLOAD), _type_structure(payload))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_LEGACY_PAYLOAD) is None:
-        payload = _new_structure_builder()
-        payload.packed = True
-        payload.append(Type.array(_named_type(bv, T_LEGACY_UOP), ZEN5_PAYLOAD_SIZE // 4), "uops")
-        bv.define_user_type(_qn(T_LEGACY_PAYLOAD), _type_structure(payload))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_ZEN5_PATCH) is None:
-        patch = _new_structure_builder()
-        patch.packed = True
-        patch.append(_named_type(bv, T_HEADER), "header")
-        patch.append(Type.array(u8(), SIGNATURE_SIZE), "signature")
-        patch.append(Type.array(u8(), MODULUS_SIZE), "modulus")
-        patch.append(Type.array(u8(), CHECK_SIZE), "check")
-        patch.append(_named_type(bv, T_OPTIONS), "options")
-        patch.append(u32(), "revision_copy")
-        patch.append(_named_type(bv, T_ZEN5_MATCH), "match_regs")
-        patch.append(_named_type(bv, T_ZEN5_MASK), "mask_regs")
-        patch.append(_named_type(bv, T_ZEN5_PAYLOAD), "payload")
-        bv.define_user_type(_qn(T_ZEN5_PATCH), _type_structure(patch))
-
-    if force_legacy_zen5 or bv.get_type_by_name(T_LEGACY_PATCH) is None:
-        patch = _new_structure_builder()
-        patch.packed = True
-        patch.append(_named_type(bv, T_HEADER), "header")
-        patch.append(Type.array(u8(), SIGNATURE_SIZE), "signature")
-        patch.append(Type.array(u8(), MODULUS_SIZE), "modulus")
-        patch.append(Type.array(u8(), CHECK_SIZE), "check")
-        patch.append(_named_type(bv, T_OPTIONS), "options")
-        patch.append(u32(), "rev")
-        patch.append(_named_type(bv, T_LEGACY_MATCH), "match_regs")
-        patch.append(_named_type(bv, T_LEGACY_MASK), "mask_regs")
-        patch.append(_named_type(bv, T_LEGACY_PAYLOAD), "microcode")
-        bv.define_user_type(_qn(T_LEGACY_PATCH), _type_structure(patch))
+    # Always keep canonical names fixed at the 8015 / 0x420 / 256-quad view (the
+    # legacy, screenshot-era profile). This must be that layout so the legacy type
+    # names (AMD_MC_MatchRegisterBlock, ...) matched by _is_default_zen5_geometry
+    # are defined; "loader" now applies the confirmed 0x8015 match[31]/mask[31]
+    # geometry whose op-quad count follows the zero padding, so request the
+    # canonical profile explicitly. Other geometries get scoped names.
+    canonical = get_loader_layout(0x8015, "sample-420")
+    _define_zen5_geometry_types(bv, canonical)
+    geometry = zen5_geometry or get_loader_layout(0x8015, zen5_layout)
+    # Always define the actual geometry's types unless it is exactly the canonical
+    # default; the tail model shares the default tuple but needs its own _TAIL_ types.
+    if not _is_default_zen5_geometry(geometry) or zen5_tail_holds_registers(geometry):
+        _define_zen5_geometry_types(bv, geometry, body_opquads_only=zen5_body_opquads_only)
 
 
 def _safe_undefine_data_var(bv, address: int) -> None:
@@ -1105,126 +1468,549 @@ def _apply_zen12_layout(bv, base: int, profile: ZenProfile) -> bool:
     return available >= ZEN12_PATCH_SIZE
 
 
-def _apply_zen5_layout(bv, base: int) -> bool:
-    """Apply the original Zenella 1.2 Zen5 layout without changing its ABI.
+# Recognize only Zenella's artifacts. A renamed/symbol-less data variable must
+# also be migrated: looking only for symbols missed those objects in older BNDBs.
+_ZEN5_OWNED_SYMBOLS = {
+    "amd_mc_header", "amd_mc_signature", "amd_mc_modulus", "amd_mc_check",
+    "amd_mc_options", "amd_mc_rev", "amd_mc_revision_copy", "amd_mc_register_table",
+    "amd_mc_match_regs", "amd_mc_mask_regs", "amd_mc_match_words", "amd_mc_match_tail",
+    "amd_mc_unknown_prefix", "amd_mc_precode_metadata", "amd_mc_payload_raw",
+    "amd_ucode_region", "amd_ucode_opquads", "amd_mc_auxiliary_raw",
+    "amd_mc_patch", "amd_zen5_patch", "amd_ucode_body",
+    "amd_mc_nop_section", "amd_mc_nop_sparse_opquads", "amd_mc_finalization_section",
+    "amd_mc_body_data_words",
+}
 
-    The order is intentional.  Zenella 1.2 first made the aggregate type
-    available, then exposed the header and every region as individual data
-    variables.  Binary Ninja consequently renders the comment at 'base+0x18'
-    inside 'AMD_MC_Header'.  Replacing this with only an outer aggregate was
-    the regression that hid the CPUID text in 2.0.0/2.0.1.
-    """
-    _ensure_types(bv, force_legacy_zen5=True)
 
-    available = _available_bytes(bv, base, ZEN5_PATCH_SIZE)
-    if available < HEADER_SIZE:
-        log_error(f"Zenella: only 0x{available:x} bytes are available at 0x{base:x}")
-        return False
-    if available < ZEN5_PATCH_SIZE:
-        log_warn(
-            f"Zenella: partial Zen5 patch: 0x{available:x}/0x{ZEN5_PATCH_SIZE:x} bytes; "
-            "the visible region types will be truncated where necessary"
-        )
+def _registered_type_name(value_type) -> str:
+    # Type.registered_name is a NamedTypeReferenceType, NOT a string; use
+    # its .name. Type.name raises NotImplementedError for unnamed integers.
+    for attr in ("registered_name", "registered_type_name", "name"):
+        try:
+            name = getattr(value_type, attr, None)
+            if name is not None:
+                if isinstance(name, (str, QualifiedName)):
+                    return str(name)
+                return str(getattr(name, "name", name))
+        except (AttributeError, NotImplementedError):
+            continue
+    return ""
 
-    patch_type = bv.get_type_by_name(T_LEGACY_PATCH)
-    header_type = bv.get_type_by_name(T_HEADER)
-    options_type = bv.get_type_by_name(T_OPTIONS)
-    match_type = bv.get_type_by_name(T_LEGACY_MATCH)
-    mask_type = bv.get_type_by_name(T_LEGACY_MASK)
-    payload_type = bv.get_type_by_name(T_LEGACY_PAYLOAD)
-    uop_type = bv.get_type_by_name(T_LEGACY_UOP)
 
-    if not all((patch_type, header_type, options_type, match_type, mask_type, payload_type, uop_type)):
-        log_error("Zenella: legacy Zen5 type repair failed; required Zenella 1.2 types are missing")
-        return False
+def _zen5_owned_region_type(value_type) -> bool:
+    name = _registered_type_name(value_type)
+    return (name in {T_HEADER, T_OPTIONS, T_LEGACY_MATCH, T_LEGACY_MASK,
+                     T_ZEN5_MATCH, T_ZEN5_MASK, T_ZEN5_PATCH, T_LEGACY_PATCH,
+                     T_ZEN5_PRECODE, T_ZEN5_OPQUAD_REGION, T_ZEN5_PAYLOAD,
+                     T_ZEN5_MATCHMASK, T_LEGACY_PAYLOAD, T_ZEN5_AUX, T_ZEN5_OPQUAD,
+                     T_ZEN5_MICROOP64, T_ZEN5_TAG, T_LEGACY_UOP, "AMD_Zen5_MatchTail",
+                     "AMD_Zen5_UnknownPrefix"}
+            or (name.startswith(("AMD_MC_L", "AMD_Zen5_L")) and name.endswith(
+                ("RegisterTable", "MatchRegisterBlock", "MaskRegisterBlock",
+                 "OpQuadRegion", "MicrocodeRegion", "AuxiliaryData", "MatchMaskTable",
+                 "PreCodeMetadata", "Patch"))))
 
-    # Keep the complete patch type available before reproducing the original visible layout
-    # The header replaces the aggregate data variable at the same address
-    if available >= ZEN5_PATCH_SIZE:
-        _define_data_var(
-            bv,
-            base,
-            patch_type,
-            "amd_mc_patch",
-            "AMD microcode patch container (header/signature/modulus/check/options/rev/match/mask/microcode)",
-        )
 
-    _define_data_var(
-        bv, base, header_type, "amd_mc_header", "AMD microcode patch header"
-    )
-    _apply_common_comments(bv, base, ZEN5)
-
-    def define_fixed_region(offset: int, size: int, value_type, name: str, comment: str) -> None:
-        remaining = max(0, available - offset)
-        if remaining <= 0:
-            return
-        if remaining >= size:
-            region_type = value_type
-        else:
-            region_type = Type.array(u8(), remaining)
-            comment = f"{comment} (partial: 0x{remaining:x}/0x{size:x} bytes)"
-        _define_data_var(bv, base + offset, region_type, name, comment)
-
-    define_fixed_region(
-        SIGNATURE_OFFSET, SIGNATURE_SIZE, Type.array(u8(), SIGNATURE_SIZE),
-        "amd_mc_signature", "0x100-byte signature block",
-    )
-    define_fixed_region(
-        MODULUS_OFFSET, MODULUS_SIZE, Type.array(u8(), MODULUS_SIZE),
-        "amd_mc_modulus", "0x100-byte modulus block",
-    )
-    define_fixed_region(
-        CHECK_OFFSET, CHECK_SIZE, Type.array(u8(), CHECK_SIZE),
-        "amd_mc_check", "0x100-byte check block",
-    )
-    define_fixed_region(
-        OPTIONS_OFFSET, OPTIONS_SIZE, options_type,
-        "amd_mc_options", "autorun/encrypted/loaderid option bytes",
-    )
-    define_fixed_region(
-        REVISION_COPY_OFFSET, REVISION_COPY_SIZE, u32(),
-        "amd_mc_rev", "Revision copy from the extended header area",
-    )
-    define_fixed_region(
-        ZEN5_MATCH_OFFSET, ZEN5_MATCH_SIZE, match_type,
-        "amd_mc_match_regs", "Match register block",
-    )
-    define_fixed_region(
-        ZEN5_MASK_OFFSET, ZEN5_MASK_SIZE, mask_type,
-        "amd_mc_mask_regs", "Mask register block",
-    )
-
-    microcode_base = base + ZEN5_PAYLOAD_OFFSET
-    microcode_available = max(0, min(available - ZEN5_PAYLOAD_OFFSET, ZEN5_PAYLOAD_SIZE))
-    microcode_size = microcode_available - (microcode_available % 4)
-    uop_count = microcode_size // 4
-    if uop_count:
-        if microcode_size == ZEN5_PAYLOAD_SIZE:
-            visible_payload_type = payload_type
-            payload_comment = "Decoded microcode uop region"
-        else:
-            # Use a named element array for partial updates
-            # This keeps the AMD_Zen_Opcode enum visible
-            try:
-                visible_payload_type = Type.array(_named_type(bv, T_LEGACY_UOP), uop_count)
-            except Exception:
-                visible_payload_type = Type.array(uop_type, uop_count)
-            payload_comment = "Decoded microcode uop region (auto-sized)"
-        _define_data_var(
-            bv, microcode_base, visible_payload_type,
-            "amd_ucode_region", payload_comment,
-        )
-
+def _symbols_at(bv, address: int):
+    # Current and legacy APIs both expose get_symbols(start, length).
     try:
-        bv.update_analysis()
-    except Exception:
-        pass
+        return list(bv.get_symbols(address, 1))
+    except (AttributeError, TypeError):
+        symbol = bv.get_symbol_at(address)
+        return [symbol] if symbol is not None else []
 
-    log_info(
-        f"Zenella: applied original Zenella 1.2 Zen5 layout at 0x{base:x} "
-        f"(microcode_off=0x{ZEN5_PAYLOAD_OFFSET:x}, uops=0x{uop_count:x})"
-    )
-    return available >= ZEN5_PATCH_SIZE
+
+def _data_var_type_at(bv, address: int):
+    item = bv.get_data_var_at(address)
+    return None if item is None else item.type
+
+
+
+def _remove_owned_data_var(bv, address: int) -> None:
+    """Remove both analysis layers at a previously identified Zenella address.
+
+    undefine_user_data_var alone can expose an older AUTO data variable underneath.
+    Only the cleanup routine calls this, after proving ownership by type, symbol,
+    or a generated-region comment. Never erase arbitrary neighboring annotations.
+    """
+    bv.undefine_user_data_var(address)
+    remaining = bv.get_data_var_at(address)
+    if remaining is not None:
+        if not bool(getattr(remaining, "auto_discovered", False)):
+            raise RuntimeError(f"Could not remove stale user variable at 0x{address:x}")
+        remove_auto = getattr(bv, "undefine_data_var", None)
+        if not callable(remove_auto):
+            raise RuntimeError(f"Cannot remove stale auto variable at 0x{address:x} on this API")
+        remove_auto(address, blacklist=True)
+        if bv.get_data_var_at(address) is not None:
+            raise RuntimeError(f"Stale variable at 0x{address:x} survived cleanup")
+
+
+def _remove_owned_symbol(bv, symbol) -> None:
+    """Use the matching API for user versus auto-discovered symbols."""
+    if bool(getattr(symbol, "auto", False)):
+        remove = getattr(bv, "undefine_auto_symbol", None)
+        if not callable(remove):
+            raise RuntimeError(f"Cannot remove auto symbol {symbol.name} on this API")
+        remove(symbol)
+    else:
+        bv.undefine_user_symbol(symbol)
+
+
+def _cleanup_stale_zen5_layout(bv, base: int, size: int = ZEN5_PATCH_SIZE) -> None:
+    """Remove old owned variables even when their symbols have been renamed.
+
+    Scope is this patch only. Unrelated types/symbols/comments are retained;
+    changes are made inside the apply command's undoable transaction.
+    """
+    addresses = {base, base + OPTIONS_OFFSET, base + REVISION_COPY_OFFSET}
+    addresses.update(base + off for off in range(0x328, min(size, 0x424), 4))
+    addresses.update((base + SIGNATURE_OFFSET, base + MODULUS_OFFSET,
+                      base + CHECK_OFFSET, base + ZEN5_AUX_OFFSET))
+    addresses.update(int(a) for a in bv.data_vars if base <= int(a) < base + size)
+    for address in sorted(addresses):
+        if not base <= address < base + size:
+            continue
+        symbols = _symbols_at(bv, address)
+        ours = [sym for sym in symbols if sym.name in _ZEN5_OWNED_SYMBOLS]
+        value_type = _data_var_type_at(bv, address)
+        comment = _get_comment_at_compat(bv, address)
+        generated_region = (address < base + 0x424 or address == base + ZEN5_AUX_OFFSET) and (
+            comment.startswith("Zenella.layout:") or "layout=" in comment and "confidence=" in comment)
+        if value_type is not None and (ours or _zen5_owned_region_type(value_type) or generated_region):
+            _remove_owned_data_var(bv, address)
+        for symbol in ours:
+            _remove_owned_symbol(bv, symbol)
+    # Generated comments are replaced, not accumulated. Researcher notes stay.
+    comment_offsets = set(range(0x320, size, 4))
+    if size > 0x322:
+        comment_offsets.add(0x322)  # old unknown1/unknown2 annotation was unaligned
+    for offset in sorted(comment_offsets):
+        address = base + offset
+        existing = _get_comment_at_compat(bv, address)
+        retained = [line for line in existing.splitlines() if not (
+            line.startswith(("candidate_quad[", "Zenella.uop[", "Zenella.seq[",
+                             "Zenella.layout:", "Raw option bytes as LE16:"))
+            or "layout=" in line and "confidence=" in line
+            or line in ("Match register block", "Mask register block")
+            or line.startswith("Raw match_tail bytes")
+        )]
+        if retained != existing.splitlines():
+            bv.set_comment_at(address, "\n".join(retained))
+
+
+def _resolve_registered_type(bv, value_type):
+    for _ in range(8):
+        target = getattr(value_type, "target", None)
+        if not callable(target):
+            return value_type
+        value_type = target(bv)
+        if value_type is None:
+            raise RuntimeError("Unresolved named type in the applied layout")
+    raise RuntimeError("Cyclic named type in the applied layout")
+
+
+def _member_signature(bv, value_type):
+    value_type = _resolve_registered_type(bv, value_type)
+    return [(m.name, m.offset, len(m.type)) for m in value_type.members]
+
+
+
+def _enum_items(bv, value_type) -> Dict[str, int]:
+    value_type = _resolve_registered_type(bv, value_type)
+    members = getattr(value_type, "members", ())
+    if not members or not all(hasattr(member, "value") for member in members):
+        members = getattr(value_type, "enumeration_members", ())
+    return {member.name: int(member.value) for member in members}
+
+
+def _uop_member_fields(value_type) -> Dict[str, Tuple[int, int]]:
+    """Read effective bit ranges, independently of member enumeration order.
+
+    BN represents an ordinary full-width member with bit_width == 0. For
+    example uint16_t imm16 at byte zero is the same 16-bit slice as imm16:16.
+    Zero width must NOT be accepted for an 8-bit opcode backed by a 16-bit enum.
+    """
+    fields = {}
+    for member in value_type.members:
+        name = str(member.name)
+        if name in fields:
+            raise RuntimeError(f"Duplicate micro-op field {name!r}")
+        position = int(getattr(member, "bit_position", 0))
+        offset = int(getattr(member, "bit_offset", int(member.offset) * 8 + position))
+        width = int(getattr(member, "bit_width", 0))
+        if width == 0:
+            if position != 0:
+                raise RuntimeError(f"Non-bitfield {name!r} has a nonzero bit position")
+            width = len(member.type) * 8
+        if offset < 0 or width <= 0 or offset + width > 64:
+            raise RuntimeError(f"Micro-op field {name!r} extends outside its 64-bit word")
+        fields[name] = (offset, width)
+    return fields
+
+
+def _verify_opcode_types(bv, uop_type) -> None:
+    """Verify effective fields and all enum values, not API list order.
+
+    A real position/width error still aborts. Diagnostics include each differing
+    field instead of the former unhelpful 'positions differ' message.
+    """
+    uop_type = _resolve_registered_type(bv, uop_type)
+    if len(uop_type) != ZEN5_RECORD_SIZE:
+        raise RuntimeError("Micro-op structure must occupy exactly eight bytes")
+    expected = {name: (offset, width) for name, offset, width in ZEN5_UOP_FIELDS}
+    actual = _uop_member_fields(uop_type)
+    if actual != expected:
+        differences = [f"{name}: expected {expected.get(name)}, observed {actual.get(name)}"
+                       for name in sorted(set(expected) | set(actual))
+                       if actual.get(name) != expected.get(name)]
+        raise RuntimeError("Micro-op bit ranges differ:\n" + "\n".join(differences))
+    opcode_type = next(member.type for member in uop_type.members if member.name == "opcode")
+    if _enum_items(bv, opcode_type) != ZEN_OPCODE_ENUM:
+        raise RuntimeError("Applied opcode enum does not preserve every supplied opcode mapping")
+
+
+def _verify_applied_zen5_layout(bv, base: int, parsed: ParsedZen5Patch, before: bytes) -> None:
+    """Read back ACTUAL data variables, not just the types we attempted to define."""
+    if bv.read(base, len(before)) != before:
+        raise RuntimeError("Input bytes changed during an annotation-only operation")
+    carve = None
+    for r in zen5_display_regions(parsed):
+        if r.name == "body":
+            # The body may be carved into named op-quad-array sections (see _zen5_body_carve_plan);
+            # then each section is verified instead of one body struct.
+            carve = _zen5_body_carve_plan(parsed, r, "")
+            if carve is not None:
+                _verify_carved_zen5_body(bv, base, carve)
+                continue
+        actual = _data_var_type_at(bv, base + r.offset)
+        if actual is None or len(actual) != len(r.raw):
+            raise RuntimeError(f"Applied {r.name} variable at +0x{r.offset:x} has wrong width")
+        actual = _resolve_registered_type(bv, actual)
+        if r.name == "options" and len(r.raw) == 4:
+            if _member_signature(bv, actual) != [("autorun", 0, 1), ("encrypted", 1, 1), ("loaderid", 2, 2)]:
+                raise RuntimeError("Stale AMD_MC_UcodeOptions: expected uint16_t loaderid at +2")
+        if r.name in ("match_registers", "mask_registers"):
+            field = "match_reg" if r.name == "match_registers" else "mask_reg"
+            if _member_signature(bv, actual) != [(field, 0, len(r.raw))]:
+                raise RuntimeError(f"Stale {field} structure remains at +0x{r.offset:x}")
+            if actual.members[0].type.count != len(r.raw) // 4:
+                raise RuntimeError(f"Wrong {field} array count")
+        if r.name == "body":
+            code_size = len(parsed.quads) * ZEN5_OPQUAD_SIZE
+            tail = zen5_tail_holds_registers(parsed.geometry)
+            # Manual layout separates the trailing zero padding into its own region,
+            # so the body is op-quads only (no folded data_words).
+            separate_padding = any(reg.name == "zero_padding" for reg in parsed.regions)
+            folds_data_words = bool(parsed.geometry.auxiliary_size) and not tail and not separate_padding
+            expected_members = [("opquads", 0, code_size)]
+            if folds_data_words:
+                expected_members.append(("data_words", code_size, parsed.geometry.auxiliary_size))
+            if _member_signature(bv, actual) != expected_members:
+                raise RuntimeError("Old/raw instruction region is still applied")
+            if folds_data_words:
+                data_array = actual.members[1].type
+                if len(data_array.element_type) != 4 or data_array.count * 4 != parsed.geometry.auxiliary_size:
+                    raise RuntimeError("Body data_words must retain every stored 32-bit value")
+            array = actual.members[0].type
+            if array.count != len(parsed.quads):
+                raise RuntimeError("Applied opquad count differs from selected loader")
+            if _member_signature(bv, array.element_type) != [
+                ("uop0", 0, 8), ("uop1", 8, 8), ("uop2", 16, 8), ("uop3", 24, 8), ("sequence_word", 32, 4)
+            ]:
+                raise RuntimeError("Expected four uint64 operations and a uint32 sequence word at +32")
+            quad_type = _resolve_registered_type(bv, array.element_type)
+            for member in quad_type.members[:4]:
+                uop_type = _resolve_registered_type(bv, member.type)
+                _verify_opcode_types(bv, uop_type)
+    # An old auto-defined variable at +0x380/+0x418 can interrupt Linear View
+    # even when every new region start has the right type.
+    expected_addresses = {base + region.offset for region in zen5_display_regions(parsed)}
+    if carve is not None:
+        expected_addresses.update(base + seg[0] for seg in carve)
+    for address, item in bv.data_vars.items():
+        if base <= int(address) < base + len(before) and int(address) not in expected_addresses:
+            if _zen5_owned_region_type(item.type) or any(
+                    symbol.name in _ZEN5_OWNED_SYMBOLS for symbol in _symbols_at(bv, int(address))):
+                raise RuntimeError(f"Stale Zenella variable still overlaps the layout at 0x{address:x}")
+    if parsed.quads:
+        scopes = _zen5_layout_type_names(parsed.geometry)
+        expected = {"options": (T_OPTIONS, "amd_mc_options"),
+                    "revision_copy": (None, "amd_mc_rev"),
+                    "match_registers": (scopes["match_registers"], "amd_mc_match_regs"),
+                    "mask_registers": (scopes["mask_registers"], "amd_mc_mask_regs"),
+                    "body": (scopes["body"], SYM_ZEN5_BODY)}
+        for region in zen5_display_regions(parsed):
+            if region.name not in expected:
+                continue
+            if region.name == "body" and carve is not None:
+                continue  # carved sections were verified above
+            name, symbol = expected[region.name]
+            actual_symbol = bv.get_symbol_at(base + region.offset)
+            if actual_symbol is None or actual_symbol.name != symbol:
+                raise RuntimeError(f"Expected visible symbol {symbol}; a competing symbol remains")
+            if name and _registered_type_name(_data_var_type_at(bv, base + region.offset)) != name:
+                raise RuntimeError(f"Expected registered type {name}; a detached/stale type remains")
+        for quad in parsed.quads:
+            if bv.read(base + quad.offset, ZEN5_OPQUAD_SIZE) != quad.raw:
+                raise RuntimeError("Operation or sequence bytes disagree with the selected layout")
+
+
+def _apply_zen5_layout(
+    bv,
+    base: int,
+    layout: str = "loader",
+    register_split: Optional[Tuple[int, int]] = None,
+) -> bool:
+    """Single apply engine: preflight -> cleanup -> types -> regions -> verify.
+
+    Normal Apply uses the configured second-header loader profile. Opcode names
+    and stored sequence values are unchanged; the 8015 display uses equal blocks.
+    Failure is visible in a dialog AND the Log. Partial/encrypted raw fallback
+    is useful in read-only reports but is not success for an Apply-code request.
+    """
+    stage = "preflight"
+    try:
+        _check_module_versions()
+        _check_loaded_plugin_copies()
+        if type(base) is not int or base < 0:
+            raise ValueError("Patch address must be a non-negative integer")
+        blob = bv.read(base, ZEN5_PATCH_SIZE)
+        parsed = parse_zen5_patch(blob, layout=layout, register_split=register_split)
+        geometry = parsed.geometry
+        if geometry is None:
+            raise RuntimeError("Parser returned no loader geometry")
+        if layout != "raw" and not parsed.quads:
+            raise RuntimeError(
+                "No instruction layout was selected: the input is incomplete or "
+                "marked encrypted. Existing analysis was not replaced.\n"
+                + "\n".join(parsed.warnings))
+        selector_label = (f"+0x{parsed.selector_offset:x}"
+                          if parsed.selector_offset is not None else "unavailable")
+        log_info(
+            f"Zenella {PLUGIN_VERSION} APPLY BEGIN: mode={layout}, base=0x{base:x}, "
+            f"selector={selector_label}, loaderid=0x{geometry.format_id:04x}, "
+            f"body=0x{geometry.quad_offset:x}; module={os.path.abspath(__file__)}")
+
+        transaction = getattr(bv, "undoable_transaction", None)
+        if not callable(transaction):
+            log_warn("Zenella: this API has no undoable_transaction; changes cannot be rolled back atomically")
+        with transaction() if callable(transaction) else nullcontext():
+            stage = "remove stale Zenella variables and symbols"
+            _cleanup_stale_zen5_layout(bv, base, len(blob))
+            stage = "rebuild loader-selected types"
+            body_opquads_only = any(r.name == "zero_padding" for r in parsed.regions)
+            _ensure_types(bv, force_legacy_zen5=True, zen5_geometry=geometry,
+                          zen5_body_opquads_only=body_opquads_only)
+            stage = "apply regions and annotations"
+            _apply_zen5_regions(bv, base, parsed)
+            stage = "verify applied database objects"
+            _verify_applied_zen5_layout(bv, base, parsed, blob)
+
+        _update_analysis_compat(bv)
+        selector = (f"+0x{parsed.selector_offset:x}"
+                    if parsed.selector_offset is not None else "unavailable")
+        complete = len(blob) >= geometry.patch_size
+        log_info(
+            f"Zenella {PLUGIN_VERSION} APPLIED+VERIFIED: layout={parsed.layout}, "
+            f"selector={selector}, loaderid=0x{geometry.format_id:04x}, "
+            f"match/mask={geometry.register_split}, body=0x{geometry.quad_offset:x}, "
+            f"quads={len(parsed.quads)}, complete={complete}; "
+            f"module={os.path.abspath(__file__)}"
+        )
+        return complete
+    except Exception as exc:
+        message = (f"Stage: {stage}\n{exc}\n\n"
+                   f"Plugin: {os.path.abspath(__file__)}\n"
+                   "No successful Apply is reported. The Log contains the traceback.")
+        log_error(f"Zenella {PLUGIN_VERSION}: apply layout FAILED: {message}\n{traceback.format_exc()}")
+        _show_apply_error(message)
+        return False
+
+
+_ZEN5_OPQUAD_MEMBERS = [
+    ("uop0", 0, 8), ("uop1", 8, 8), ("uop2", 16, 8), ("uop3", 24, 8), ("sequence_word", 32, 4)
+]
+
+
+def _zen5_body_carve_plan(parsed: ParsedZen5Patch, region, base_comment: str):
+    """Plan how the op-quad body is carved into named AMD_Zen5_OpQuad[] data vars so the NOP
+    section and the finalization sequence appear as distinct labelled blocks in the linear
+    view (framed exactly like amd_mc_zero_padding) while every op-quad still decodes.
+
+    Returns a list of (rel_offset, rel_end, symbol, comment, as_opquads) segments covering the
+    body region gap-free, or None when the body must stay a single data var (no geometry, no
+    detectable NOP section, or an unexpectedly short body). Shared by the define and verify
+    stages so both agree on the exact addresses."""
+    if parsed.geometry is None or not parsed.quads:
+        return None
+    sections = zen5_detect_body_sections(parsed.quads, region.offset)
+    nop = next((s for s in sections if s["name"] == "nop_section"), None)
+    if nop is None:
+        return None
+    opquad_bytes = parsed.geometry.quad_count * ZEN5_OPQUAD_SIZE
+    if len(region.raw) < opquad_bytes:
+        return None  # unexpected short body; leave it whole
+    fin = next((s for s in sections if s["name"] == "finalization_section"), None)
+
+    body_start = region.offset
+    opquad_end = region.offset + opquad_bytes          # end of the decoded op-quad array
+    body_end = region.offset + len(region.raw)          # may include folded data_words (loader layout)
+    fin_start = fin["offset"] if fin is not None else nop["end"]
+    fin_end = fin["end"] if fin is not None else nop["end"]
+
+    nop_note = ("Zenella.section: NOP section: dense run of NOP words (opcode 0xFF) before the "
+                "finalization sequence; op-quads still decoded")
+    if not nop["aligned"]:
+        nop_note += ("\nZenella.section: NOTE: at this register boundary the NOP words are shifted "
+                     "off the uop slots, so they do not decode as opcode 0xFF NOP")
+        hint = zen5_nop_alignment_hint(parsed.patch_bytes, region.offset, parsed.geometry.patch_size)
+        split = parsed.geometry.register_split
+        if hint is not None and split is not None:
+            nop_note += (f"; a match+mask total of {sum(split) + hint['register_total_delta']} "
+                         f"(op-quads at 0x{hint['suggested_quad_offset']:x}) puts them on the slots")
+    plan = [
+        (body_start, nop["offset"], SYM_ZEN5_BODY, base_comment, True),
+        (nop["offset"], nop["end"], "amd_mc_nop_section", nop_note, True),
+        (nop["end"], fin_start, "amd_mc_nop_sparse_opquads",
+         "Zenella.section: single ops interleaved with NOPs between the NOP section and the "
+         "finalization sequence; op-quads still decoded", True),
+        (fin_start, fin_end, "amd_mc_finalization_section",
+         "Zenella.section: Finalization sequence: op-quads after the last NOP of the NOP "
+         "section's sparse tail, up to the trailing zero padding; op-quads still decoded", True),
+        # Any op-quads after the finalization sequence (e.g. trailing zero op-quads when the
+        # trailing zero padding is not carved into its own region, as in the loader/auto layout).
+        (fin_end, opquad_end, SYM_ZEN5_OPQUADS,
+         "Zenella.section: trailing op-quads after the finalization sequence (often zero-filled)", True),
+        # Folded stored data words after the op-quad array (loader/auto layout keeps them inside body).
+        (opquad_end, body_end, "amd_mc_body_data_words",
+         "Zenella.layout: stored DWORD data after the op-quad array (purpose unverified)", False),
+    ]
+    return [seg for seg in plan if seg[1] > seg[0]]
+
+
+def _define_zen5_body_sections(bv, parsed: ParsedZen5Patch, base: int, region, base_comment: str) -> bool:
+    """Carve the op-quad body into named AMD_Zen5_OpQuad[] data vars: main code, the NOP section,
+    the sparse NOP/op quads, and the finalization sequence, so the sections appear as distinct
+    labelled blocks in the linear view (like amd_mc_zero_padding) while still decoding as op-quads.
+
+    Returns True when it defined the segmented data vars; False to let the caller define the body
+    as a single data var (see _zen5_body_carve_plan)."""
+    plan = _zen5_body_carve_plan(parsed, region, base_comment)
+    if plan is None:
+        return False
+    opquad_t = _named_type(bv, T_ZEN5_OPQUAD)
+    for off_rel, end_rel, symbol, note, as_opquads in plan:
+        length = end_rel - off_rel
+        if as_opquads and opquad_t is not None and length % ZEN5_OPQUAD_SIZE == 0:
+            value_type = Type.array(opquad_t, length // ZEN5_OPQUAD_SIZE)
+        elif not as_opquads and length % 4 == 0:
+            value_type = Type.array(u32(), length // 4)
+        else:
+            value_type = Type.array(u8(), length)
+        address = base + off_rel
+        bv.define_user_data_var(address, value_type)
+        bv.define_user_symbol(Symbol(SymbolType.DataSymbol, address, symbol))
+        bv.set_comment_at(address, note)
+    return True
+
+
+def _verify_carved_zen5_body(bv, base: int, plan) -> None:
+    """Read back every carved body segment: exact width, the planned symbol, and (for op-quad
+    segments) an AMD_Zen5_OpQuad[] whose element still has four uint64 operations + the
+    uint32 sequence word with the supplied opcode enum."""
+    for off_rel, end_rel, symbol, _note, as_opquads in plan:
+        address = base + off_rel
+        length = end_rel - off_rel
+        actual = _data_var_type_at(bv, address)
+        if actual is None or len(actual) != length:
+            raise RuntimeError(f"Applied body section {symbol} at +0x{off_rel:x} has wrong width")
+        found = bv.get_symbol_at(address)
+        if found is None or found.name != symbol:
+            raise RuntimeError(f"Expected visible symbol {symbol} at +0x{off_rel:x}; a competing symbol remains")
+        if as_opquads and length % ZEN5_OPQUAD_SIZE == 0:
+            array = _resolve_registered_type(bv, actual)
+            element = getattr(array, "element_type", None)
+            count = getattr(array, "count", None)
+            if element is None or count != length // ZEN5_OPQUAD_SIZE:
+                raise RuntimeError(f"Body section {symbol} at +0x{off_rel:x} is not an op-quad array")
+            if _member_signature(bv, element) != _ZEN5_OPQUAD_MEMBERS:
+                raise RuntimeError("Expected four uint64 operations and a uint32 sequence word at +32")
+            quad_type = _resolve_registered_type(bv, element)
+            for member in quad_type.members[:4]:
+                _verify_opcode_types(bv, _resolve_registered_type(bv, member.type))
+
+
+def _apply_zen5_regions(bv, base: int, parsed: ParsedZen5Patch) -> None:
+    """Apply the parsed regions and annotations after types have been rebuilt."""
+    scoped = _zen5_layout_type_names(parsed.geometry)
+    mapping = {
+        "header": (T_HEADER, "amd_mc_header"),
+        "options": (T_OPTIONS, "amd_mc_options"),
+        "revision_copy": (None, "amd_mc_rev"),
+        "register_table": (scoped.get("register_table"), SYM_ZEN5_PRECODE),
+        "match_registers": (scoped.get("match_registers"), "amd_mc_match_regs"),
+        "mask_registers": (scoped.get("mask_registers"), "amd_mc_mask_regs"),
+        "prefix_metadata": (scoped.get("prefix_metadata"), SYM_ZEN5_METADATA),
+        "match_mask_table": (scoped.get("match_mask_table"), SYM_ZEN5_MATCHMASK),
+        "body": (scoped.get("body"), SYM_ZEN5_BODY),
+        "opaque_payload": (None, "amd_mc_payload_raw"),
+    }
+    for region in zen5_display_regions(parsed):
+        type_name, symbol = mapping.get(region.name, (None, "amd_mc_" + region.name))
+        value_type = _named_type(bv, type_name) if type_name else None
+        if region.name == "revision_copy" and len(region.raw) == 4:
+            value_type = u32()
+        if value_type is None or len(value_type) != len(region.raw):
+            value_type = Type.array(u8(), len(region.raw))
+        address = base + region.offset
+        old_comment = _get_comment_at_compat(bv, address)
+        # Replace only generated layout text, not independent researcher comments.
+        old_comment = "\n".join(line for line in old_comment.splitlines() if not (
+            line.startswith("Zenella.layout:")
+            or ("layout=" in line and "confidence=" in line)
+        ))
+        comment = "Zenella.layout: " + region.interpretation
+        if old_comment:
+            comment += "\n" + old_comment
+        # The op-quad body is carved into named op-quad-array data vars (main / NOP / finalization)
+        # so the NOP and finalization sections appear as distinct labelled blocks in linear view,
+        # exactly like amd_mc_zero_padding but typed as AMD_Zen5_OpQuad[] so op-quads still decode.
+        if region.name == "body" and _define_zen5_body_sections(bv, parsed, base, region, comment):
+            continue
+        bv.define_user_data_var(address, value_type)
+        bv.define_user_symbol(Symbol(SymbolType.DataSymbol, address, symbol))
+        bv.set_comment_at(address, comment)
+    _apply_common_comments(bv, base, ZEN5)
+    has_zero_padding = any(r.name == "zero_padding" for r in parsed.regions)
+    if parsed.quads and parsed.geometry.auxiliary_size and not has_zero_padding:
+        if zen5_tail_holds_registers(parsed.geometry):
+            _append_comment_at(bv, base + parsed.geometry.code_end,
+                "Zenella.layout: match/mask registers after the op-quads, two equal halves "
+                "(13-bit ROM match addresses + control, then masks); trailing slots zero-filled")
+        else:
+            _append_comment_at(bv, base + parsed.geometry.code_end,
+                f"Zenella.layout: {parsed.geometry.auxiliary_size}-byte remainder after the op-quads "
+                "(unavoidable: a valid-sequence op-quad offset cannot tile the patch to the exact end); "
+                "not opquads, not registers")
+    # Do not generate a second copy of the renderer's output as address comments.
+    # The fallback still provides opcode names when a BN build has no DataRenderer.
+    if not _register_zen5_renderer():
+        for index, quad in enumerate(parsed.quads):
+            for slot, tag in enumerate(quad.uops):
+                _append_comment_at(bv, base + tag.offset,
+                    f"Zenella.uop[{index}.{slot}]: " + zen5_uop_field_text(tag, _ZEN5_TAG_NAMES))
+
+    # Sequence words stay plain uint32_t. Annotate the upstream interpretation
+    # once, regardless of whether the micro-op renderer is installed.
+    for index, quad in enumerate(parsed.quads):
+        _append_comment_at(bv, base + quad.offset + 32,
+            f"Zenella.seq[{index}]: " + decode_zentool_sequence_word(quad.sequence_word).text)
+    stats = zen5_sequence_statistics(parsed.quads)
+    log_info(f"Zenella: stored sequence_word==1: {stats['exact_one_count']}/{stats['count']}; "
+             "zentool interpretation is relative +1, not a sequence counter")
+    for warning in parsed.warnings:
+        log_warn("Zenella: " + warning)
 
 
 #####################################################################################################
@@ -2294,52 +3080,6 @@ def _show_zen12_report(bv, base: int, profile: Optional[ZenProfile] = None) -> N
         log_error(f"Zenella: disassembly report failed: {exc}")
 
 
-def _zen5_report_text(blob: bytes) -> str:
-    if len(blob) < ZEN5_PATCH_SIZE:
-        raise ValueError(f"Need 0x{ZEN5_PATCH_SIZE:x} bytes; got 0x{len(blob):x}")
-    lines = [
-        f"; Zenella {PLUGIN_VERSION} / EXPERIMENTAL Zen5 structural-tag listing",
-        "; This renders the AMD_Zen_Opcode structural tags only.",
-        "; It is NOT a decoded Zen5 instruction stream: Zen5 ISA semantics are",
-        "; undocumented, so operands beyond the raw imm16 tag payload are unknown.",
-        "",
-    ]
-    lines.extend(_format_header_directives(blob))
-
-    lines.extend(["", "; Match Registers"])
-    for index in range(0, ZEN5_MATCH_SIZE, 4):
-        word = int.from_bytes(blob[ZEN5_MATCH_OFFSET + index:ZEN5_MATCH_OFFSET + index + 4], "little")
-        lines.append(f".match_reg {index // 4} 0x{word:08x}")
-
-    lines.extend(["", "; Mask Registers"])
-    for index in range(0, ZEN5_MASK_SIZE, 4):
-        word = int.from_bytes(blob[ZEN5_MASK_OFFSET + index:ZEN5_MASK_OFFSET + index + 4], "little")
-        lines.append(f".mask_reg {index // 4} 0x{word:08x}")
-
-    lines.extend(["", "; Micro-op structural tags (offset: opcode b1 imm16lo imm16hi)"])
-    payload = blob[ZEN5_PAYLOAD_OFFSET:ZEN5_PAYLOAD_OFFSET + ZEN5_PAYLOAD_SIZE]
-    lines.extend(render_zen5_tag_lines(payload, _ZEN5_TAG_NAMES))
-    return "\n".join(lines)
-
-
-def _show_zen5_report(bv, base: int) -> None:
-    blob = bv.read(base, ZEN5_PATCH_SIZE)
-    if len(blob) < HEADER_SIZE:
-        log_error("Zenella: no complete AMD patch header at the selected address")
-        return
-    detection = detect_profile(blob)
-    if detection.profile is not None and detection.profile != ZEN5:
-        log_warn(
-            f"Zenella: address looks like {detection.profile.name}, not Zen5; "
-            "rendering the Zen5 structural tags anyway (experimental)"
-        )
-    try:
-        text = _zen5_report_text(blob)
-        show_plain_text_report(f"Zenella Zen5 tag listing @ 0x{base:x}", text)
-    except Exception as exc:
-        log_error(f"Zenella: Zen5 tag listing failed: {exc}")
-
-
 def _apply_profile(
     bv,
     base: int,
@@ -2384,208 +3124,371 @@ def _auto_detect_and_apply(bv, base: int, analyze_all_slots: bool = True) -> Non
 #####################################################################################################
 
 
-def cmd_define_types(bv):
-    # Repair the legacy Zen5 ABI and the Zen1 and Zen2 package types
-    # This covers BNDB files created before Zenella 2.0.4
-    _ensure_types(bv, force_legacy_zen5=True, force_zen12=True)
-    log_info(
-        "Zenella: AMD Zen1/Zen2/Zen5 types are available; "
-        "Zenella 1.2 Zen5 types and explicit Zen1/Zen2 uop fields restored"
-    )
-
-
-def cmd_legacy_define_types(bv):
-    _ensure_types(bv, force_legacy_zen5=True)
-
-
-def cmd_legacy_apply_at_zero(bv):
-    _apply_zen5_layout(bv, 0)
-
-
-def cmd_legacy_apply_at_cursor(bv, address):
-    _apply_zen5_layout(bv, address)
-
-
-def cmd_reload_cpuid_db(bv):
-    del bv
-    db = _load_cpuid_db(force_reload=True)
-    log_info(f"Zenella: CPUID description database reloaded ({len(db)} keys)")
-
-
+# --- Auto-detect -------------------------------------------------------------
 def cmd_auto_start(bv):
-    _auto_detect_and_apply(bv, 0)
+    return _auto_detect_and_apply(bv, 0)
 
 
 def cmd_auto_cursor(bv, address):
-    _auto_detect_and_apply(bv, address)
+    return _auto_detect_and_apply(bv, address)
 
 
-def cmd_auto_all_slots_start(bv):
-    _auto_detect_and_apply(bv, 0, analyze_all_slots=True)
-
-
-def cmd_auto_all_slots_cursor(bv, address):
-    _auto_detect_and_apply(bv, address, analyze_all_slots=True)
-
-
-def cmd_auto_compact_start(bv):
-    _auto_detect_and_apply(bv, 0, analyze_all_slots=False)
-
-
-def cmd_auto_compact_cursor(bv, address):
-    _auto_detect_and_apply(bv, address, analyze_all_slots=False)
-
-
+# --- Zen1 / Zen2 disassembly + LLIL/HLIL lifting -----------------------------
 def cmd_zen1_start(bv):
-    _apply_profile(bv, 0, ZEN1)
+    return _apply_profile(bv, 0, ZEN1, map_hlil=True)
 
 
 def cmd_zen1_cursor(bv, address):
-    _apply_profile(bv, address, ZEN1)
+    return _apply_profile(bv, address, ZEN1, map_hlil=True)
 
 
 def cmd_zen2_start(bv):
-    _apply_profile(bv, 0, ZEN2)
+    return _apply_profile(bv, 0, ZEN2, map_hlil=True)
 
 
 def cmd_zen2_cursor(bv, address):
-    _apply_profile(bv, address, ZEN2)
+    return _apply_profile(bv, address, ZEN2, map_hlil=True)
 
 
+def cmd_zen12_report_start(bv):
+    return _show_zen12_report(bv, 0)
+
+
+def cmd_zen12_report_cursor(bv, address):
+    return _show_zen12_report(bv, address)
+
+
+# --- Zen5 structural layout ---------------------------------------------------
 def cmd_zen5_start(bv):
-    _apply_profile(bv, 0, ZEN5, map_hlil=False)
+    """Normal file-start Apply path: the confirmed loader-0x8015 geometry with
+    match[31]/mask[31] registers at 0x328 and op-quads from 0x420 up to the
+    trailing zero padding (ZEN5_8015_REGISTER_SPLIT in zenella_core)."""
+    return _apply_zen5_layout(bv, 0, layout="loader")
 
 
 def cmd_zen5_cursor(bv, address):
-    _apply_profile(bv, address, ZEN5, map_hlil=False)
+    """Same implementation for an embedded patch."""
+    return _apply_zen5_layout(bv, address, layout="loader")
 
 
-def cmd_report_start(bv):
-    _show_zen12_report(bv, 0)
+def cmd_zen5_exactfit_start(bv):
+    """Experimental: force the exact-fit 0x418/370 view (no tail).
+
+    The normal Zen5 apply auto-detects 0x420 vs 0x418 from the op-quad/sequence
+    content; this forces the exact-fit alternative for comparison. Note it may
+    misalign sequence words (0x0 instead of the documented +1) on updates whose
+    real body is at 0x420 -- that is exactly what auto-detect avoids.
+    """
+    return _apply_zen5_layout(bv, 0, layout="exact")
 
 
-def cmd_report_cursor(bv, address):
-    _show_zen12_report(bv, address)
+def cmd_zen5_scan_start(bv):
+    """Experimental: scan candidate body offsets (register-area sizes) and apply
+    the one whose sequence words look most reasonable. No documented evidence
+    backs any particular size; this is an empirical alignment search.
+    """
+    return _apply_zen5_layout(bv, 0, layout="scan")
 
 
-def cmd_zen5_report_start(bv):
-    _show_zen5_report(bv, 0)
+def cmd_zen5_tail_start(bv):
+    """Experimental: metadata before the op-quads, equal match/mask registers AFTER
+    them. Op-quads at 0x420 (valid sequences) and the 0x2820 region is the register
+    table, so this has no trailer AND no 0x0 sequence words at the same time.
+    """
+    return _apply_zen5_layout(bv, 0, layout="tail")
 
 
-def cmd_zen5_report_cursor(bv, address):
-    _show_zen5_report(bv, address)
+def cmd_zen5_manual_registers(bv):
+    """Experimental: manually set the match and mask register DWORD counts.
+
+    The op-quad body boundary moves to 0x328 + 4*(match+mask), so this brute-forces
+    where the register area ends and the microcode begins. No documented evidence
+    backs any particular size; it is an interactive alignment probe.
+    """
+    from binaryninja.interaction import get_int_input
+    title = "Zenella: manual register boundary"
+    match_count = get_int_input("Match register DWORDs", title)
+    if match_count is None:
+        log_info("Zenella: manual register boundary cancelled")
+        return False
+    mask_count = get_int_input("Mask register DWORDs", title)
+    if mask_count is None:
+        log_info("Zenella: manual register boundary cancelled")
+        return False
+    if match_count <= 0 or mask_count <= 0:
+        log_error("Zenella: match and mask register counts must both be positive")
+        return False
+    blob = bv.read(0, _core_module.ZEN5_PATCH_SIZE)
+    fit = _core_module.zen5_manual_fit(match_count, mask_count, blob)
+    # Warn when this match+mask total misaligns the op-quads: the NOP section is still found
+    # and framed at this boundary, but its NOP words are shifted off the uop slots (so they do
+    # not decode as opcode 0xFF NOP) while a nearby 4/8-byte shift puts them on the slots.
+    quad_offset = _core_module.EXTENDED_HEADER_SIZE + 4 * (match_count + mask_count)
+    hint = zen5_nop_alignment_hint(blob, quad_offset, _core_module.ZEN5_PATCH_SIZE)
+    if hint is not None:
+        total = match_count + mask_count
+        want_total = total + hint["register_total_delta"]
+        shift = abs(hint["delta"])
+        msg = (f"match+mask total {total} puts the op-quads at 0x{quad_offset:x}. The NOP section "
+               f"is found there (framed as amd_mc_nop_section), but its NOP words are shifted "
+               f"{shift} bytes off the uop slots, so they do not decode as opcode 0xFF NOP. "
+               f"A total of {want_total} (op-quads at 0x{hint['suggested_quad_offset']:x}) puts the "
+               f"{hint['nop_quads']}-quad NOP run on the slots.")
+        other = _core_module.zen5_manual_fit(match_count, mask_count + hint["register_total_delta"], blob)
+        if fit["tail_bytes"] == 0 and fit["padding_bytes"] and other["tail_bytes"]:
+            msg += (f" Note: {total} is the total that meets the zero padding exactly; "
+                    f"{want_total} leaves a {other['tail_bytes']}-byte tail before it.")
+        log_warn("Zenella: " + msg)
+        _show_notice("op-quad alignment", msg)
+    boundary = (f"the zero padding at 0x{fit['padding_start']:x}"
+                if fit["padding_bytes"] else "the patch end")
+    if fit["tail_bytes"]:
+        notice = (
+            f"match[{match_count}]/mask[{mask_count}] (total {match_count + mask_count}) "
+            f"leaves {fit['tail_bytes']} bytes between the op-quad body and {boundary}.\n"
+            f"For a clean body|padding split use a match+mask total of "
+            f"{fit['exact_fit_totals']} (any split summing to that).\nApplying anyway.")
+        log_warn("Zenella: " + notice.replace("\n", " "))
+        _show_notice("trailing bytes", notice)
+    elif fit["padding_bytes"]:
+        log_info(
+            f"Zenella: manual match[{match_count}]/mask[{mask_count}]: {fit['quad_count']} "
+            f"op-quads meet the zero padding at 0x{fit['padding_start']:x} exactly "
+            f"({fit['padding_bytes']} padding bytes)")
+    else:
+        log_info(
+            f"Zenella: manual match[{match_count}]/mask[{mask_count}] is exact-fit to the "
+            f"patch end ({fit['quad_count']} op-quads, no trailing bytes)")
+    return _apply_zen5_layout(bv, 0, layout="manual",
+                              register_split=(match_count, mask_count))
 
 
-# Keep the original Zenella 1.2 commands unchanged
-# They also repair stale type definitions from Zenella 2.0.0 and 2.0.1
-PluginCommand.register(
-    "AMD Microcode\\Define types (self-contained)",
-    "Define AMD microcode structs (+ enums best-effort) in this database",
-    cmd_legacy_define_types,
-)
-PluginCommand.register(
-    "AMD Microcode\\Apply layout at file start (0x0)",
-    "Define types (if needed) and apply AMD microcode layout at 0",
-    cmd_legacy_apply_at_zero,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Apply layout at cursor",
-    "Define types (if needed) and apply AMD microcode layout at cursor address",
-    cmd_legacy_apply_at_cursor,
-)
+#####################################################################################################
+# Zen5 enum-token DataRenderer. Restores the user's opcode names and fields.
+# No per-word raw/projection/uncertainty paragraphs are inserted into Linear view.
+#####################################################################################################
+_ZEN5_RENDER_STRUCT_NAMES = (T_ZEN5_MICROOP64, T_ZEN5_TAG, T_LEGACY_UOP)
+_ZEN5_RENDERER_INSTANCE = None
+_ZEN5_RENDERER_REGISTERED = False
 
-PluginCommand.register(
-    "AMD Microcode\\Define Zenella types (Zen1/Zen2/Zen5)",
-    "Define AMD microcode structures for all supported Zenella profiles",
-    cmd_define_types,
-)
-PluginCommand.register(
-    "AMD Microcode\\Reload CPUID description database",
-    "Reload bundled or locally replaced cpuid_descriptions.json without restarting Binary Ninja",
-    cmd_reload_cpuid_db,
-)
-PluginCommand.register(
-    "AMD Microcode\\Auto-detect and analyze at file start",
-    "Detect Zen1, Zen2, or Zen5; annotate every record and create all 64 Zen1/Zen2 package functions",
-    cmd_auto_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Auto-detect and analyze at cursor",
-    "Detect an embedded patch; annotate every record and create all 64 Zen1/Zen2 package functions",
-    cmd_auto_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen1\\Apply layout + LLIL/HLIL at file start",
-    "Force the Zen1 0xc80 layout and map its 64 instruction packages as executable code",
-    cmd_zen1_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen1\\Apply layout + LLIL/HLIL at cursor",
-    "Force the Zen1 layout for an embedded patch at the cursor",
-    cmd_zen1_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen2\\Apply layout + LLIL/HLIL at file start",
-    "Force the Zen2 0xc80 layout and map its 64 instruction packages as executable code",
-    cmd_zen2_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen2\\Apply layout + LLIL/HLIL at cursor",
-    "Force the Zen2 layout for an embedded patch at the cursor",
-    cmd_zen2_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen5\\Apply structural layout at file start",
-    "Apply the Zen5 0x3820 structural/tag layout (no unsupported ISA semantics inferred)",
-    cmd_zen5_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen5\\Apply structural layout at cursor",
-    "Apply the Zen5 structural/tag layout to an embedded patch",
-    cmd_zen5_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen5\\(Experimental) Disassemble tags to assembly at file start",
-    "Render the Zen5 structural tags as an assembly-like listing (no ISA semantics inferred)",
-    cmd_zen5_report_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen5\\(Experimental) Disassemble tags to assembly at cursor",
-    "Render an embedded Zen5 patch's structural tags as an assembly-like listing",
-    cmd_zen5_report_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen1-Zen2\\Show ZenUtils-style disassembly at file start",
-    "Open a text report containing all 64 packages, four uops per package, and sequence words",
-    cmd_report_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen1-Zen2\\Show ZenUtils-style disassembly at cursor",
-    "Open a ZenUtils-style report for an embedded Zen1/Zen2 patch",
-    cmd_report_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen1-Zen2\\Analyze all 64 package entries at file start (aggressive)",
-    "Compatibility alias: exhaustive 64-package LLIL/HLIL analysis is now the default",
-    cmd_auto_all_slots_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen1-Zen2\\Analyze all 64 package entries at cursor (aggressive)",
-    "Compatibility alias: create a function at every package entry in an embedded update",
-    cmd_auto_all_slots_cursor,
-)
-PluginCommand.register(
-    "AMD Microcode\\Zen1-Zen2\\Analyze compact control-flow roots at file start",
-    "Create only the minimum disconnected control-flow roots instead of all 64 package functions",
-    cmd_auto_compact_start,
-)
-PluginCommand.register_for_address(
-    "AMD Microcode\\Zen1-Zen2\\Analyze compact control-flow roots at cursor",
-    "Use compact root-only analysis for an embedded Zen1/Zen2 update",
-    cmd_auto_compact_cursor,
-)
 
+def _safe_is_type_of_struct_name(type_obj, name, context) -> bool:
+    if DataRenderer is None:
+        return False
+    try:
+        return bool(DataRenderer.is_type_of_struct_name(type_obj, name, context))
+    except Exception:
+        return False
+
+
+def _zen5_render_tokens(word: int, prefix):
+    """Tokens for one micro-op: 'opcode = <NAME>  rd=.. rs=.. ... unit=..'."""
+    text_type = _instruction_token_type("TextToken")
+    enum_type = _instruction_token_type("EnumerationMemberToken", "TypeNameToken", "TextToken")
+    tag = decode_zen5_tag(word.to_bytes(8, "little"))
+    class_name = OPCLASS_NAMES.get(tag.exec_unit, f"0b{tag.exec_unit:03b}")
+    is_ldstop = zen5_is_ldstop(tag)
+    tokens = list(prefix)
+    tokens.append(_token(text_type, "opcode = "))
+    if is_ldstop:
+        # A LdStOp resolves to a concrete LD/ST by the ldst bit (bit 45): 1 -> LD, 0 -> ST.
+        # The [47:55] slice is not a LdStOp's type, so it is not used for the name.
+        name, value = ("AMD_ZEN_LD", 0x100) if tag.load else ("AMD_ZEN_ST", 0x101)
+        tokens.append(_token(enum_type, name, value))
+    elif tag.opcode == 0x00:
+        # Non-LdStOp with a zero opcode slice: the legacy AMD_ZEN_UOP_LD_ST_00 name implied
+        # load/store, which this is not. Label it by class (all-zero words are class=0 -> SPEC).
+        tokens.append(_token(text_type, f"{class_name.upper()}.0x00"))
+    else:
+        name = _ZEN5_TAG_NAMES.get(tag.opcode)
+        if name is not None:
+            tokens.append(_token(enum_type, name, tag.opcode))
+        else:
+            tokens.append(_token(text_type, f"0x{tag.opcode:02x}"))
+    tokens.append(_token(
+        text_type,
+        f"  rd=r{tag.rd} rs=r{tag.rs} rt=r{tag.rt} imm16=0x{tag.imm16:04x} "
+        f"size={tag.size} ld={tag.load} st={tag.store} "
+        f"class={tag.exec_unit} ({class_name})",
+    ))
+    # Flag op-quad framing artifacts (top 32 bits zero, low 32 bits real data): not a real op.
+    # The single-record renderer has no patch-wide sequence-word set, so it flags on top32==0.
+    if zen5_is_alignment_artifact(tag):
+        tokens.append(_token(text_type, "  (align?)"))
+        return tokens
+    # Append the inferred per-opcode operand decode for nonzero words only; the
+    # single-record renderer has no previous word, so imm32 shows its low half.
+    if tag.word != 0:
+        tokens.append(_token(text_type, "  asm=" + zen5_uop_operand_text(tag)))
+    return tokens
+
+
+if DataRenderer is not None:
+
+    class _Zen5MicroOpRenderer(DataRenderer):
+        """Type-specific renderer for AMD_Zen5_MicroOp64 / AMD_Zen5_MicroOpTag / AMD_Zen_MicroOp."""
+
+        def perform_is_valid_for_data(self, ctxt, view, addr, type_obj, context):
+            return any(
+                _safe_is_type_of_struct_name(type_obj, name, context)
+                for name in _ZEN5_RENDER_STRUCT_NAMES
+            )
+
+        def _render(self, view, addr, prefix):
+            try:
+                raw = view.read(addr, ZEN5_RECORD_SIZE)
+            except Exception:
+                raw = None
+            if not raw or len(raw) != ZEN5_RECORD_SIZE:
+                return []
+            word = int.from_bytes(raw, "little")
+            tokens = _zen5_render_tokens(word, prefix)
+            if DisassemblyTextLine is None:
+                return []
+            try:
+                return [DisassemblyTextLine(tokens, addr)]
+            except Exception:
+                try:
+                    return [DisassemblyTextLine(tokens)]
+                except Exception:
+                    return []
+
+        # The documented API exposes both entry points; implement both.
+        def perform_get_lines_for_data(self, ctxt, view, addr, type_obj, prefix, width, context):
+            return self._render(view, addr, prefix)
+
+        def perform_get_lines_for_data_with_language(
+            self, ctxt, view, addr, type_obj, prefix, width, context, language
+        ):
+            return self._render(view, addr, prefix)
+
+else:  # pragma: no cover - depends on Binary Ninja build
+    _Zen5MicroOpRenderer = None
+
+
+def _register_zen5_renderer() -> bool:
+    global _ZEN5_RENDERER_INSTANCE, _ZEN5_RENDERER_REGISTERED
+    if _ZEN5_RENDERER_REGISTERED:
+        return True
+    if _Zen5MicroOpRenderer is None or DisassemblyTextLine is None:
+        log_warn("Zenella: Binary Ninja DataRenderer API unavailable; opcode names remain in comments and reports")
+        return False
+    try:
+        renderer = _Zen5MicroOpRenderer()
+        renderer.register_type_specific()
+        _ZEN5_RENDERER_INSTANCE = renderer
+        _ZEN5_RENDERER_REGISTERED = True
+        return True
+    except Exception as exc:  # pragma: no cover - depends on Binary Ninja build
+        log_warn(f"Zenella: could not register the Zen5 micro-op renderer: {exc}")
+        return False
+
+
+#####################################################################################################
+# Plugin registration
+#####################################################################################################
+_PLUGIN_COMMANDS_REGISTERED = False
+
+
+def _register_plugin_commands() -> None:
+    """Only file-start and cursor Apply; reports remain available through the CLI.
+
+    Remove old installed Zenella copies before restarting. A plugin cannot
+    safely unregister another module's native renderers by dropping Python refs.
+    """
+    global _PLUGIN_COMMANDS_REGISTERED
+    if _PLUGIN_COMMANDS_REGISTERED:
+        return
+    R = MENU_ROOT
+
+    # Auto-detect the architecture from the header, then apply the right layout.
+    PluginCommand.register(
+        R + r"\Auto-detect and apply at file start",
+        "Detect Zen1/Zen2/Zen5 from the header and apply the matching layout",
+        cmd_auto_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Auto-detect and apply at cursor",
+        "Detect and apply the matching layout for a patch beginning at the cursor",
+        cmd_auto_cursor,
+    )
+
+    # Zen1: full disassembly + LLIL/HLIL lifting.
+    PluginCommand.register(
+        R + r"\Zen1\Apply layout + LLIL/HLIL at file start",
+        "Apply the Zen1 layout and lift micro-ops to LLIL/HLIL",
+        cmd_zen1_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Zen1\Apply layout + LLIL/HLIL at cursor",
+        "Apply the Zen1 layout and lift micro-ops at the cursor",
+        cmd_zen1_cursor,
+    )
+
+    # Zen2: full disassembly + LLIL/HLIL lifting.
+    PluginCommand.register(
+        R + r"\Zen2\Apply layout + LLIL/HLIL at file start",
+        "Apply the Zen2 layout and lift micro-ops to LLIL/HLIL",
+        cmd_zen2_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Zen2\Apply layout + LLIL/HLIL at cursor",
+        "Apply the Zen2 layout and lift micro-ops at the cursor",
+        cmd_zen2_cursor,
+    )
+
+    # Shared Zen1/Zen2 text disassembly report (ZenUtils style).
+    PluginCommand.register(
+        R + r"\Zen1-Zen2\Show ZenUtils-style disassembly at file start",
+        "Print a ZenUtils-style disassembly of the Zen1/Zen2 payload",
+        cmd_zen12_report_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Zen1-Zen2\Show ZenUtils-style disassembly at cursor",
+        "Print a ZenUtils-style disassembly for a patch at the cursor",
+        cmd_zen12_report_cursor,
+    )
+
+    # Zen5: structural layout (confirmed 0x8015 geometry: match[31]/mask[31], op-quads at 0x420).
+    PluginCommand.register(
+        R + r"\Zen5\Apply structural layout at file start",
+        "Apply the confirmed 0x8015 layout: match[31]/mask[31] registers at 0x328, op-quads from "
+        "0x420 to the zero padding, opcode tags and sequence words",
+        cmd_zen5_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Zen5\Apply structural layout at cursor",
+        "Apply the same confirmed match[31]/mask[31] layout to a patch beginning at the cursor",
+        cmd_zen5_cursor,
+    )
+    PluginCommand.register(
+        R + r"\Zen5\Experimental\Apply exact-fit 0x418/370 (no tail) at file start",
+        "Force the exact-fit body (370 opquads, no trailing tail) instead of the auto-detected offset",
+        cmd_zen5_exactfit_start,
+    )
+    PluginCommand.register(
+        R + r"\Zen5\Experimental\Apply best-scoring body offset (scan) at file start",
+        "Scan register-area sizes and apply the offset whose sequence words look most reasonable (no documented evidence)",
+        cmd_zen5_scan_start,
+    )
+    PluginCommand.register(
+        R + r"\Zen5\Experimental\Apply tail match-mask model (no trailer, valid sequences) at file start",
+        "Metadata before the op-quads; equal match/mask registers after them (op-quads at 0x420, no trailer, no 0x0 sequences)",
+        cmd_zen5_tail_start,
+    )
+    PluginCommand.register(
+        R + r"\Zen5\Experimental\Set match/mask register counts (move boundary) at file start",
+        "Manually set match and mask register DWORD counts; the op-quad body boundary moves to "
+        "0x328 + 4*(match+mask). Experimental; no documented evidence backs any particular size.",
+        cmd_zen5_manual_registers,
+    )
+    _PLUGIN_COMMANDS_REGISTERED = True
+
+
+_register_zen5_renderer()
+_register_plugin_commands()
 log_info(
     f"Zenella {PLUGIN_VERSION}: loaded from {os.path.abspath(__file__)}; "
-    "registered Zen1/Zen2 decoders, LLIL lifters, and Zen5 structural parser"
+    f"menu root '{MENU_ROOT}' with Auto-detect, Zen1, Zen2, Zen1-Zen2 and Zen5 commands; "
+    f"Zen5 default layout is the confirmed 0x8015 geometry: match[31]/mask[31] at 0x328, op-quads at 0x420"
 )
