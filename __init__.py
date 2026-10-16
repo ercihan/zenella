@@ -10,3 +10,4 @@ if __package__:
             raise
     else:
         from . import amd_zen_ucode
+        from . import amd_prezen_ucode

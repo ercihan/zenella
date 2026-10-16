@@ -206,8 +206,12 @@ else:  # Direct import for manual development use
 
 if __package__:
     from . import zenella_inspect as _inspect_module
+    from . import prezen_core as _prezen_module
+    from .prezen_core import detect_prezen
 else:
     import zenella_inspect as _inspect_module
+    import prezen_core as _prezen_module
+    from prezen_core import detect_prezen  # type: ignore
 
 PLUGIN_VERSION = "2.2.0"
 # A balanced menu: auto-detect, one submenu per architecture (Zen1/Zen2 disassembly
@@ -222,13 +226,17 @@ APPLY_CURSOR_COMMAND = MENU_ROOT + r"\Zen5\Apply structural layout at cursor"
 def _check_module_versions() -> None:
     """Prevent a stale core from silently restoring an older layout on reapply."""
     root = os.path.dirname(os.path.realpath(__file__))
-    for module, attr in ((_core_module, "CORE_VERSION"), (_inspect_module, "VERSION")):
+    for module, attr in (
+        (_core_module, "CORE_VERSION"),
+        (_inspect_module, "VERSION"),
+        (_prezen_module, "CORE_VERSION"),
+    ):
         actual = getattr(module, attr, "missing")
         path = os.path.realpath(getattr(module, "__file__", ""))
         if actual != PLUGIN_VERSION or os.path.dirname(path) != root:
             raise RuntimeError(
                 f"Zenella {PLUGIN_VERSION}: mixed or stale modules: {path} is {actual}. "
-                f"Replace all three scripts in {root} and restart Binary Ninja; "
+                f"Replace all Zenella scripts in {root} and restart Binary Ninja; "
                 "no layout has been applied.")
 
 
@@ -3102,6 +3110,17 @@ def _apply_profile(
 
 def _auto_detect_and_apply(bv, base: int, analyze_all_slots: bool = True) -> None:
     blob = bv.read(base, ZEN5_PATCH_SIZE)
+    # Pre-Zen K8/K10 patches (loader 0x8000/0x8003, families 0x0F-0x12) have their own menu group
+    # and decoder; route them there before the Zen header logic sees them.
+    prezen = detect_prezen(blob)
+    if prezen.matched:
+        log_info(f"Zenella: detected pre-Zen K8/K10 ({prezen.confidence} confidence): {prezen.reason}")
+        if __package__:
+            from . import amd_prezen_ucode
+        else:
+            import amd_prezen_ucode  # type: ignore
+        amd_prezen_ucode._apply_prezen(bv, base)
+        return
     detection = detect_profile(blob)
     if detection.profile is None:
         log_error(f"Zenella: architecture auto-detection failed: {detection.reason}")
@@ -3404,7 +3423,7 @@ def _register_plugin_commands() -> None:
     # Auto-detect the architecture from the header, then apply the right layout.
     PluginCommand.register(
         R + r"\Auto-detect and apply at file start",
-        "Detect Zen1/Zen2/Zen5 from the header and apply the matching layout",
+        "Detect pre-Zen K8/K10, Zen1, Zen2 or Zen5 from the header and apply the matching layout",
         cmd_auto_start,
     )
     PluginCommand.register_for_address(
@@ -3489,6 +3508,6 @@ _register_zen5_renderer()
 _register_plugin_commands()
 log_info(
     f"Zenella {PLUGIN_VERSION}: loaded from {os.path.abspath(__file__)}; "
-    f"menu root '{MENU_ROOT}' with Auto-detect, Zen1, Zen2, Zen1-Zen2 and Zen5 commands; "
+    f"menu root '{MENU_ROOT}' with Auto-detect, Pre-Zen (K8/K10), Zen1, Zen2, Zen1-Zen2 and Zen5 commands; "
     f"Zen5 default layout is the confirmed 0x8015 geometry: match[31]/mask[31] at 0x328, op-quads at 0x420"
 )
