@@ -23,6 +23,8 @@ if __package__:
         decode_zentool_sequence_word, zen5_sequence_statistics,
         analyze_zen5_tail, zen5_scan_body_offsets, decode_zen5_operands,
         zen5_detect_body_sections,
+        render_zen5_flow_listing, render_zen5_flow_sequence, zen5_flow_chains, zen5_flow_to_dict,
+        zen5_resolve_patch_base,
     )
 else:
     from zenella_core import (
@@ -32,6 +34,8 @@ else:
         decode_zentool_sequence_word, zen5_sequence_statistics,
         analyze_zen5_tail, zen5_scan_body_offsets, decode_zen5_operands,
         zen5_detect_body_sections,
+        render_zen5_flow_listing, render_zen5_flow_sequence, zen5_flow_chains, zen5_flow_to_dict,
+        zen5_resolve_patch_base,
     )
 
 VERSION = "2.2.0"
@@ -275,6 +279,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON with all region bytes and records")
     parser.add_argument("--output", type=Path, help="write report instead of stdout (never overwrite the input)")
     parser.add_argument("--no-diagnostics", action="store_true", help="omit alignment comparisons")
+    parser.add_argument("--flow", action="store_true",
+                        help="experimental: one flat instruction stream in sequence-word execution order "
+                             "(assembly per micro-op, raw hex when undecodable) instead of the structural "
+                             "report; with --json adds 'flow_chains'. The structural Zen5 decoding is not changed")
+    parser.add_argument("--flow-detail", action="store_true",
+                        help="experimental: the same ordering as --flow but grouped into chains with quad "
+                             "headers, rule table and end reasons")
+    parser.add_argument("--patch-base", metavar="ADDR|auto|none", default="0x1f00",
+                        help="--flow/--flow-detail: ROM address of quad 0 so sequence-word targets in that window "
+                             "continue inside the patch (default 0x1f00, observed in every decrypted Zen5 "
+                             "sample); 'auto' picks the best-scoring base, 'none' makes every ROM target end a run")
     args = parser.parse_args(argv)
     try:
         if args.output and (args.output.resolve() == args.input.resolve()
@@ -297,11 +312,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scan = None
         if args.scan_boundary and len(data) - args.base >= ZEN5_PATCH_SIZE:
             scan = zen5_scan_body_offsets(data, args.base)
+        flow = args.flow or args.flow_detail
+        patch_base = args.patch_base.strip().lower()
+        if patch_base not in ("auto", "none"):
+            patch_base = int(patch_base, 0)
+        if flow and not parsed.quads:
+            raise ValueError("--flow needs decoded op-quads; the patch is encrypted, incomplete or raw")
         if args.json:
             payload = parsed_to_dict(parsed, diagnostics)
             if scan is not None:
                 payload["boundary_scan"] = scan
+            if flow:
+                base, _ = zen5_resolve_patch_base(parsed.quads, patch_base)
+                payload["flow_patch_base"] = base
+                payload["flow_chains"] = zen5_flow_to_dict(zen5_flow_chains(parsed, base))
             text = json.dumps(payload, indent=2) + "\n"
+        elif args.flow_detail:
+            text = "\n".join(render_zen5_flow_listing(parsed, patch_base)) + "\n"
+        elif args.flow:
+            text = "\n".join(render_zen5_flow_sequence(parsed, patch_base)) + "\n"
         else:
             text = render_patch_report(parsed, diagnostics)
             if scan is not None:

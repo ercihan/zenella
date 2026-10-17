@@ -136,6 +136,8 @@ if __package__:  # Never fall back to an unrelated installed copy on ImportError
         rom_address_to_payload_offset,
         rom_address_to_slot,
         slot_to_rom_address,
+        render_zen5_flow_listing,
+        render_zen5_flow_sequence,
     )
 else:  # Direct import for manual development use
     import zenella_core as _core_module
@@ -201,6 +203,8 @@ else:  # Direct import for manual development use
         rom_address_to_payload_offset,
         rom_address_to_slot,
         slot_to_rom_address,
+        render_zen5_flow_listing,
+        render_zen5_flow_sequence,
     )
 
 
@@ -3217,6 +3221,57 @@ def cmd_zen5_tail_start(bv):
     return _apply_zen5_layout(bv, 0, layout="tail")
 
 
+def _show_zen5_flow_report(bv, base: int, detail: bool = False) -> None:
+    """Experimental, read-only: micro-ops in sequence-word execution order as a report tab.
+
+    Reads the bytes, parses them with the normal loader layout and renders either
+    the flat instruction stream (default) or the chain view (detail=True), both with
+    the observed patch RAM base 0x1f00. Nothing is written to the BinaryView and the
+    structural Zen5 decoding is untouched.
+    """
+    blob = bv.read(base, ZEN5_PATCH_SIZE)
+    if len(blob) < HEADER_SIZE:
+        log_error("Zenella: no complete AMD patch header at the selected address")
+        return
+    try:
+        parsed = parse_zen5_patch(blob, 0, "loader")
+    except ValueError as exc:
+        log_error(f"Zenella: Zen5 parse failed at 0x{base:x}: {exc}")
+        _show_apply_error(str(exc))
+        return
+    if not parsed.quads:
+        message = (f"no decoded op-quads at 0x{base:x}: the patch is encrypted, incomplete or raw "
+                   f"({parsed.confidence}); decrypt it first")
+        log_error(f"Zenella: {message}")
+        _show_apply_error(message)
+        return
+    try:
+        if detail:
+            text = "\n".join(render_zen5_flow_listing(parsed, tag_names=_ZEN5_TAG_NAMES))
+            show_plain_text_report(f"Zenella Zen5 sequence-ordered op-quad chains @ 0x{base:x}", text)
+        else:
+            text = "\n".join(render_zen5_flow_sequence(parsed, tag_names=_ZEN5_TAG_NAMES))
+            show_plain_text_report(f"Zenella Zen5 instruction sequence @ 0x{base:x}", text)
+    except Exception as exc:
+        log_error(f"Zenella: Zen5 flow listing failed: {exc}")
+
+
+def cmd_zen5_flow_start(bv):
+    return _show_zen5_flow_report(bv, 0)
+
+
+def cmd_zen5_flow_cursor(bv, address):
+    return _show_zen5_flow_report(bv, address)
+
+
+def cmd_zen5_flow_detail_start(bv):
+    return _show_zen5_flow_report(bv, 0, detail=True)
+
+
+def cmd_zen5_flow_detail_cursor(bv, address):
+    return _show_zen5_flow_report(bv, address, detail=True)
+
+
 def cmd_zen5_manual_registers(bv):
     """Experimental: manually set the match and mask register DWORD counts.
 
@@ -3500,6 +3555,29 @@ def _register_plugin_commands() -> None:
         "Manually set match and mask register DWORD counts; the op-quad body boundary moves to "
         "0x328 + 4*(match+mask). Experimental; no documented evidence backs any particular size.",
         cmd_zen5_manual_registers,
+    )
+    PluginCommand.register(
+        R + r"\Zen5\Experimental\Show sequence-ordered op-quad listing at file start",
+        "Experimental, read-only: follow the sequence words (1 = next, targets 0x1f00.. = patch quads, "
+        "hooked ROM addresses = quad 2N) and print one flat instruction stream in that order, assembly "
+        "per micro-op or raw hex when undecodable. The structural Zen5 layout is not changed.",
+        cmd_zen5_flow_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Zen5\Experimental\Show sequence-ordered op-quad listing at cursor",
+        "Same flat instruction stream for a decrypted Zen5 patch beginning at the cursor",
+        cmd_zen5_flow_cursor,
+    )
+    PluginCommand.register(
+        R + r"\Zen5\Experimental\Show sequence-ordered op-quad chains (detailed) at file start",
+        "Experimental, read-only: the same ordering grouped into chains with quad headers, the rule table "
+        "and the reason each chain ends",
+        cmd_zen5_flow_detail_start,
+    )
+    PluginCommand.register_for_address(
+        R + r"\Zen5\Experimental\Show sequence-ordered op-quad chains (detailed) at cursor",
+        "Same detailed chain view for a decrypted Zen5 patch beginning at the cursor",
+        cmd_zen5_flow_detail_cursor,
     )
     _PLUGIN_COMMANDS_REGISTERED = True
 

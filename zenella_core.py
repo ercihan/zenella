@@ -2619,3 +2619,399 @@ __all__: Sequence[str] = (
     "ZEN2_PROC_REV_PARTS",
     "ZEN5_PROC_REV_PARTS",
 )
+
+
+#####################################################################################################
+# Experimental: sequence-ordered op-quad flow listing (Zen5)
+#
+# Read-only view over already-decoded op-quads. Nothing here changes parse_zen5_patch, the Zen5
+# layout, the opcode tags or the structural report; it only chains the quads by their sequence
+# words and renders each micro-op as assembly text (when the operand model applies) or as a raw hex
+# word. Documented facts (zentool docs/intro.md, ucode.h): sequence word 1 = forward relative one
+# (next quad), sequence word 7 = return from emulation, match register N redirects to quad 2N,
+# action 0 = RELATIVE ("continue forward to relative quad"), action 2 = ABSOLUTE ("jump to ROM
+# address"). Everything else below is labelled as a hypothesis.
+#####################################################################################################
+
+# Observed Zen5 patch RAM base in microcode ROM address space. In every decrypted Zen5 sample the
+# sequence-word targets cluster in 0x1f00..0x1fff (none fall between the highest hooked ROM address
+# and 0x1f00), the lowest such target is exactly 0x1f00, and one quad jumps to 0x1f00 = quad 0.
+# So a 13-bit target t with 0x1f00 <= t < 0x1f00 + quad_count is patch quad (t - 0x1f00).
+ZEN5_PATCH_RAM_BASE = 0x1F00
+
+ZEN5_FLOW_RULES: Tuple[Tuple[str, str, str], ...] = (
+    ("next", "documented", "sequence word 1: continue with the next op-quad (zentool: forward relative one)"),
+    ("complete", "documented", "sequence word 7: return from emulation; the chain ends"),
+    ("stop", "hypothesis", "sequence word 0, or a relative target that leaves the patch: the chain ends"),
+    ("patch", "inferred", "13-bit target inside patch_base..patch_base+quads (default base 0x1f00, observed in every "
+                          "decrypted sample): continue at quad (target - base), whatever the flag bits say"),
+    ("relative", "hypothesis", "zentool action 0 with a small target t: continue at quad index + t (flag bits retained, not interpreted)"),
+    ("hook", "documented", "target equals a match-register address: the CPU re-enters the patch at that register's entry quad"),
+    ("rom", "hypothesis", "any other word with a 13-bit target: jump to ROM quad address 'target', which is not in the file; the chain ends"),
+    ("unknown", "hypothesis", "flag bits without a target: the chain ends and the raw word is shown"),
+    ("entry", "inferred", "match register N: m1 enters at quad 2N (zentool), m2 at quad 2N+1 (inferred: every odd quad below "
+                        "2*registers is otherwise unreached); quad 0 and unreached quads start their own chains"),
+)
+
+
+@dataclass(frozen=True)
+class ZenFlowStep:
+    """Outcome of one sequence word for the quad at `index`."""
+    index: int
+    word: int
+    kind: str                    # next | complete | stop | patch | relative | hook | rom | unknown
+    rule: str                    # documented | inferred | hypothesis
+    target_index: Optional[int]  # quad index to continue at, or None when the chain ends
+    rom_target: Optional[int]    # 13-bit target for patch / hook / rom steps
+    note: str
+
+
+@dataclass(frozen=True)
+class ZenFlowChain:
+    label: str                   # match[N] | quad 0 | orphan
+    entry: int                   # entry quad index
+    quads: Tuple[int, ...]       # quads printed by this chain, in order (may be empty)
+    end_kind: str                # complete | stop | rom | unknown | visited
+    end_target: Optional[int]    # visited: quad index; rom: ROM address
+    end_note: str
+    entry_note: str = ""
+
+
+def zen5_flow_hooks(match_words: Sequence[int]) -> Dict[int, int]:
+    """Hooked ROM address -> entry quad: m1 of register N enters at 2N, m2 at 2N+1 (first hit wins)."""
+    hooks: Dict[int, int] = {}
+    for number, word in enumerate(match_words):
+        if not word:
+            continue
+        fields = decode_match_entry(word)
+        for slot, address in enumerate((fields.m1, fields.m2)):
+            if address:
+                hooks.setdefault(address, 2 * number + slot)
+    return hooks
+
+
+def zen5_flow_step(index: int, word: int, quad_count: int,
+                   patch_base: Optional[int] = ZEN5_PATCH_RAM_BASE,
+                   hooks: Optional[Dict[int, int]] = None) -> ZenFlowStep:
+    """Classify a sequence word; see ZEN5_FLOW_RULES."""
+    word &= 0xFFFFFFFF
+    fields = decode_zentool_sequence_word(word)
+    if word == 1:
+        if index + 1 < quad_count:
+            return ZenFlowStep(index, word, "next", "documented", index + 1, None, "next op-quad")
+        return ZenFlowStep(index, word, "stop", "hypothesis", None, None, "next op-quad lies beyond the patch")
+    if word == 7:
+        return ZenFlowStep(index, word, "complete", "documented", None, None, "return from emulation")
+    if word == 0:
+        return ZenFlowStep(index, word, "stop", "hypothesis", None, None, "zero sequence word")
+    target = fields.target
+    flags = f"zentool action 0x{fields.action:x}"
+    flags += ", nodelay" if fields.nodelay else ""
+    flags += f", flags 0x{fields.other_bits:08x}" if fields.other_bits else ""
+    if target and patch_base is not None and 0 <= target - patch_base < quad_count:
+        mapped = target - patch_base
+        return ZenFlowStep(index, word, "patch", "inferred", mapped, target,
+                           f"0x{target:04x} = quad[{mapped:03d}] (patch base 0x{patch_base:04x}; {flags})")
+    if fields.action == 0 and target < quad_count:
+        extra = f" (flag bits 0x{word & ~0x1FFF:08x} retained)" if word & ~0x1FFF else ""
+        if target == 0:
+            return ZenFlowStep(index, word, "stop", "hypothesis", None, None, f"relative +0{extra}")
+        relative = index + target
+        if relative < quad_count:
+            return ZenFlowStep(index, word, "relative", "hypothesis", relative, None,
+                               f"relative +{target} -> quad[{relative:03d}]{extra}")
+        return ZenFlowStep(index, word, "stop", "hypothesis", None, None,
+                           f"relative +{target} leaves the patch{extra}")
+    if target != 0:
+        if hooks and target in hooks and hooks[target] < quad_count:
+            entry = hooks[target]
+            return ZenFlowStep(index, word, "hook", "documented", entry, target,
+                               f"ROM 0x{target:04x} is hooked by match[{entry // 2}].m{entry % 2 + 1} "
+                               f"-> quad[{entry:03d}] ({flags})")
+        return ZenFlowStep(index, word, "rom", "hypothesis", None, target,
+                           f"ROM 0x{target:04x} ({flags}), not in patch")
+    return ZenFlowStep(index, word, "unknown", "hypothesis", None, None,
+                       f"{flags} without target; raw 0x{word:08x}")
+
+
+def zen5_flow_entries(match_words: Sequence[int], quad_count: int) -> List[Tuple[str, int]]:
+    """Entry quads: register N -> quad 2N (m1) and 2N+1 (m2) for every non-zero word, then quad 0."""
+    entries: List[Tuple[str, int]] = []
+    for number, word in enumerate(match_words):
+        if not word:
+            continue
+        for slot in (0, 1):
+            if 2 * number + slot < quad_count:
+                entries.append((f"match[{number}].m{slot + 1}", 2 * number + slot))
+    if quad_count > 0 and not any(index == 0 for _, index in entries):
+        entries.append(("quad 0", 0))
+    return entries
+
+
+def zen5_flow_match_words(parsed: "ParsedZen5Patch") -> List[int]:
+    region = next((r for r in parsed.regions if r.name == "match_registers"), None)
+    if region is None:
+        return []
+    raw = region.raw
+    return [int.from_bytes(raw[i:i + 4], "little") for i in range(0, len(raw) - len(raw) % 4, 4)]
+
+
+def zen5_flow_absolute_targets(quads: Sequence[DecodedZen5OpQuad]) -> List[int]:
+    """13-bit targets of every sequence word that is not 0, 1 or 7 and not a small relative hop."""
+    count = len(quads)
+    targets: List[int] = []
+    for quad in quads:
+        word = quad.sequence_word & 0xFFFFFFFF
+        if word in (0, 1, 7):
+            continue
+        fields = decode_zentool_sequence_word(word)
+        if fields.target == 0 or (fields.action == 0 and fields.target < count):
+            continue
+        targets.append(fields.target)
+    return targets
+
+
+def zen5_guess_patch_base(quads: Sequence[DecodedZen5OpQuad]) -> Optional[Tuple[int, int, int]]:
+    """The ROM base that makes the most absolute targets land inside the patch (highest base on ties).
+
+    Returns (base, hits, total_targets) or None when no sequence word carries such a target.
+    """
+    count = len(quads)
+    targets = zen5_flow_absolute_targets(quads)
+    if count == 0 or not targets:
+        return None
+    best = None
+    for base in range(0, 0x2000):
+        hits = sum(1 for t in targets if 0 <= t - base < count)
+        if best is None or hits >= best[1]:
+            best = (base, hits, len(targets))
+    return best
+
+
+def zen5_flow_chains_from_quads(quads: Sequence[DecodedZen5OpQuad], match_words: Sequence[int],
+                                patch_base: Optional[int] = ZEN5_PATCH_RAM_BASE) -> List[ZenFlowChain]:
+    """Chain the quads: match-register entries first, then quad 0, then unreached quads in order."""
+    count = len(quads)
+    visited: Dict[int, int] = {}   # quad index -> chain number (1-based)
+    chains: List[ZenFlowChain] = []
+    hooks = zen5_flow_hooks(match_words)
+
+    def follow(label: str, entry: int, entry_note: str) -> None:
+        number = len(chains) + 1
+        printed: List[int] = []
+        current: Optional[int] = entry
+        end_kind, end_target, end_note = "stop", None, ""
+        while current is not None:
+            if current in visited:
+                end_kind, end_target = "visited", current
+                end_note = f"quad[{current:03d}] already listed in chain {visited[current]}"
+                break
+            visited[current] = number
+            printed.append(current)
+            step = zen5_flow_step(current, quads[current].sequence_word, count, patch_base, hooks)
+            end_kind, end_note = step.kind, step.note
+            end_target = step.rom_target if step.kind == "rom" else None
+            current = step.target_index
+        if current is None and end_kind in ("next", "relative", "patch", "hook"):
+            end_kind = "stop"
+        chains.append(ZenFlowChain(label, entry, tuple(printed), end_kind, end_target, end_note, entry_note))
+
+    for label, entry in zen5_flow_entries(match_words, count):
+        note = ""
+        if label.startswith("match["):
+            number, slot = label[6:].split("].m")
+            word = match_words[int(number)]
+            fields = decode_match_entry(word)
+            address = fields.m1 if slot == "1" else fields.m2
+            note = f"hooks ROM 0x{address:04x}; raw=0x{word:08x}"
+        follow(label, entry, note)
+    for index in range(count):
+        if index not in visited:
+            follow("orphan", index, "not reached from any entry or chain")
+    return chains
+
+
+def zen5_flow_chains(parsed: "ParsedZen5Patch",
+                     patch_base: Optional[int] = ZEN5_PATCH_RAM_BASE) -> List[ZenFlowChain]:
+    return zen5_flow_chains_from_quads(parsed.quads, zen5_flow_match_words(parsed), patch_base)
+
+
+def zen5_flow_uop_text(tag: DecodedZen5Tag, prev_word: Optional[int],
+                       names: Optional[Dict[int, str]] = None) -> Tuple[str, bool]:
+    """(text, is_assembly): assembly when the operand model applies, else the raw hex word."""
+    names = load_zen5_opcode_names() if names is None else names
+    if tag.word == 0:
+        return f"0x{tag.word:016x}  ; zero word", False
+    if zen5_is_alignment_artifact(tag):
+        return f"0x{tag.word:016x}  ; alignment artifact (top 32 bits zero)", False
+    label = zen5_opcode_label(tag, names)
+    operands = decode_zen5_operands(tag, prev_word)
+    if operands.asm:
+        suffix = f"  ; {label}"
+        if operands.note:
+            suffix += f", {operands.note}"
+        return f"{operands.asm}{suffix}", True
+    if tag.opcode not in names and not zen5_is_ldstop(tag):
+        reason = f"opcode 0x{tag.opcode:02x} unnamed"
+    else:
+        reason = f"{label}: {operands.note or 'no operand model'}"
+    return f"0x{tag.word:016x}  ; {reason}", False
+
+
+def zen5_resolve_patch_base(parsed_quads: Sequence[DecodedZen5OpQuad],
+                            patch_base=ZEN5_PATCH_RAM_BASE) -> Tuple[Optional[int], str]:
+    """(base or None, description). patch_base: int, None/"none" (disable) or "auto" (best guess)."""
+    guess = zen5_guess_patch_base(parsed_quads)
+    guess_text = (f"best guess 0x{guess[0]:04x} ({guess[1]}/{guess[2]} absolute targets land inside the patch)"
+                  if guess else "no absolute targets to score")
+    if patch_base is None or (isinstance(patch_base, str) and patch_base.lower() == "none"):
+        return None, f"patch base: none (ROM targets end the chain); {guess_text}"
+    if isinstance(patch_base, str) and patch_base.lower() == "auto":
+        if guess is None:
+            return None, f"patch base: auto requested but {guess_text}"
+        return guess[0], f"patch base: 0x{guess[0]:04x} (auto; {guess[1]}/{guess[2]} absolute targets land inside the patch)"
+    base = int(patch_base, 0) if isinstance(patch_base, str) else int(patch_base)
+    hits = sum(1 for t in zen5_flow_absolute_targets(parsed_quads) if 0 <= t - base < len(parsed_quads))
+    total = len(zen5_flow_absolute_targets(parsed_quads))
+    origin = "observed Zen5 patch RAM base" if base == ZEN5_PATCH_RAM_BASE else "user supplied"
+    return base, f"patch base: 0x{base:04x} ({origin}; {hits}/{total} absolute targets land inside the patch); {guess_text}"
+
+
+_resolve_patch_base = zen5_resolve_patch_base
+
+
+def render_zen5_flow_listing(parsed: "ParsedZen5Patch", patch_base=ZEN5_PATCH_RAM_BASE,
+                             tag_names: Optional[Dict[int, str]] = None) -> List[str]:
+    """Sequence-ordered listing: every quad once, assembly or hex per micro-op."""
+    names = load_zen5_opcode_names() if tag_names is None else tag_names
+    quads = parsed.quads
+    base, base_text = zen5_resolve_patch_base(quads, patch_base)
+    chains = zen5_flow_chains_from_quads(quads, zen5_flow_match_words(parsed), base)
+    lines = [
+        "; Zenella experimental: Zen5 op-quads in sequence-word order",
+        f"; patch sha256 {parsed.sha256}; layout {parsed.layout} ({parsed.confidence}); {len(quads)} op-quads",
+        "; The structural Zen5 layout is unchanged; this listing only reorders already-decoded op-quads.",
+        "; Each micro-op is assembly when the inferred operand model applies, otherwise the raw 64-bit word.",
+        "; Chain rules:",
+    ]
+    for kind, rule, text in ZEN5_FLOW_RULES:
+        lines.append(f";   {kind:<9} [{rule:<10}] {text}")
+    lines.append(f"; {base_text}")
+    match_entries = [c for c in chains if c.label.startswith("match[")]
+    lines.append(f"; entries: {len(match_entries)} match-register hooks ({len(match_entries) // 2} registers x m1/m2), "
+                 "quad 0, then orphans in file order")
+    lines.append("")
+
+    asm_lines = hex_lines = 0
+    for number, chain in enumerate(chains, 1):
+        head = f"== chain {number}: {chain.label} -> quad[{chain.entry:03d}]"
+        if chain.entry_note:
+            head += f" ({chain.entry_note})"
+        lines.append(head)
+        for index in chain.quads:
+            quad = quads[index]
+            lines.append(f"quad[{index:03d}] @0x{quad.offset:04x}    ; seq 0x{quad.sequence_word:08x}")
+            for slot, tag in enumerate(quad.uops):
+                prev = quad.uops[slot - 1].word if slot else None
+                text, is_asm = zen5_flow_uop_text(tag, prev, names)
+                asm_lines += is_asm
+                hex_lines += not is_asm
+                lines.append(f"    0x{tag.offset:04x}  {text}")
+        if chain.end_kind == "visited":
+            lines.append(f"    -> quad[{chain.end_target:03d}] {chain.end_note.split(' ', 1)[1]}")
+        elif chain.end_kind == "rom":
+            lines.append(f"    -> ROM 0x{chain.end_target:04x} [hypothesis] {chain.end_note} ; chain ends")
+        elif chain.end_kind == "complete":
+            lines.append("    -> complete [documented] return from emulation ; chain ends")
+        else:
+            lines.append(f"    -> {chain.end_kind} [hypothesis] {chain.end_note} ; chain ends")
+        lines.append("")
+
+    covered = sum(len(c.quads) for c in chains)
+    orphans = sum(1 for c in chains if c.label == "orphan")
+    unknown = sum(1 for c in chains if c.end_kind == "unknown")
+    lines.append(f"; summary: {len(chains)} chains ({len(match_entries)} from match-register hooks, {orphans} orphan); "
+                 f"quads covered: {covered}/{len(quads)}; micro-ops: {asm_lines} assembly, {hex_lines} hex; "
+                 f"{unknown} chains end on an unknown sequence word")
+    return lines
+
+
+def render_zen5_flow_sequence(parsed: "ParsedZen5Patch", patch_base=ZEN5_PATCH_RAM_BASE,
+                              tag_names: Optional[Dict[int, str]] = None) -> List[str]:
+    """One flat instruction stream in execution order: a line per micro-op, assembly or raw hex.
+
+    Only comment lines (';') interrupt the stream: where a run starts (entry / continue), where a
+    sequence word jumps to another quad inside the patch, and where a run leaves to ROM or stops.
+    """
+    names = load_zen5_opcode_names() if tag_names is None else tag_names
+    quads = parsed.quads
+    count = len(quads)
+    match_words = zen5_flow_match_words(parsed)
+    base, base_text = zen5_resolve_patch_base(quads, patch_base)
+    hooks = zen5_flow_hooks(match_words)
+    chains = zen5_flow_chains_from_quads(quads, match_words, base)
+    if base is None:
+        base_line = f"; patch base none: every jump to a ROM address ends the run ({base_text.split('; ', 1)[-1]})"
+    else:
+        base_line = (f"; patch base 0x{base:04x}: sequence-word targets 0x{base:04x}..0x{base + count - 1:04x} "
+                     f"continue inside the patch ({base_text.split('(', 1)[1].split(')')[0]})")
+    lines = [
+        "; Zenella experimental: Zen5 micro-ops in sequence-word execution order "
+        "(one line per micro-op: assembly, or the raw 64-bit word when undecodable)",
+        f"; patch sha256 {parsed.sha256}; layout {parsed.layout} ({parsed.confidence}); {count} op-quads",
+        base_line,
+        "; rules: 1 = next quad, 7 = return, in-window target = patch quad, hooked ROM address = that hook's entry "
+        "quad (m1 -> 2N, m2 -> 2N+1), other ROM targets end the run; the structural Zen5 decoding is unchanged",
+    ]
+    asm_lines = hex_lines = 0
+    for number, chain in enumerate(chains, 1):
+        if chain.label.startswith("match["):
+            lines.append(f"; entry {chain.label} -> quad[{chain.entry:03d}] ({chain.entry_note})")
+        elif chain.label == "quad 0":
+            lines.append("; entry quad[000] (patch start)")
+        else:
+            lines.append(f"; continue quad[{chain.entry:03d}] (file order)")
+        for position, index in enumerate(chain.quads):
+            quad = quads[index]
+            for slot, tag in enumerate(quad.uops):
+                prev = quad.uops[slot - 1].word if slot else None
+                text, is_asm = zen5_flow_uop_text(tag, prev, names)
+                asm_lines += is_asm
+                hex_lines += not is_asm
+                lines.append(f"0x{tag.offset:04x}  {text}")
+            if position + 1 < len(chain.quads):
+                step = zen5_flow_step(index, quad.sequence_word, count, base, hooks)
+                if step.kind != "next":
+                    nxt = chain.quads[position + 1]
+                    how = (f"target 0x{step.rom_target:04x} = patch base + 0x{nxt:x}" if step.kind == "patch"
+                           else step.note)
+                    lines.append(f"; -> quad[{nxt:03d}] @0x{quads[nxt].offset:04x} "
+                                 f"(seq 0x{quad.sequence_word:08x}, {how})")
+        last_word = quads[chain.quads[-1]].sequence_word if chain.quads else None
+        seq = f"seq 0x{last_word:08x}" if last_word is not None else "entry"
+        if chain.end_kind == "visited":
+            lines.append(f"; -> quad[{chain.end_target:03d}] @0x{quads[chain.end_target].offset:04x} "
+                         f"already listed above ({seq})")
+        elif chain.end_kind == "rom":
+            lines.append(f"; -> ROM 0x{chain.end_target:04x} (leaves patch; {seq})")
+        elif chain.end_kind == "complete":
+            lines.append("; return (seq 7)")
+        elif chain.end_kind == "unknown":
+            lines.append(f"; unknown sequence word ({chain.end_note})")
+        else:
+            lines.append(f"; stop ({chain.end_note}; {seq})")
+    covered = sum(len(c.quads) for c in chains)
+    entries = sum(1 for c in chains if c.label != "orphan")
+    lines.append(f"; end: {covered}/{count} op-quads, {asm_lines} assembly and {hex_lines} hex micro-ops, "
+                 f"{len(chains)} runs ({entries} from hook entries, {len(chains) - entries} file-order continuations)")
+    return lines
+
+
+def zen5_flow_to_dict(chains: Sequence[ZenFlowChain]) -> List[dict]:
+    return [
+        {
+            "label": c.label, "entry": c.entry, "quads": list(c.quads), "end_kind": c.end_kind,
+            "end_target": c.end_target, "end_note": c.end_note, "entry_note": c.entry_note,
+        }
+        for c in chains
+    ]
