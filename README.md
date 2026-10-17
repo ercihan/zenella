@@ -188,7 +188,3 @@ Applying the layout to a Zen 5 update:
 </video>
 
 https://github.com/user-attachments/assets/ee68d1ea-b8fb-478a-8a3e-c21d8ae99a45
-
-Earlier Zen 1 / Zen 2 demo (Zenella 1.2):
-
-https://github.com/user-attachments/assets/d15d805b-866c-4494-bcf9-918ed7bc2ea7
